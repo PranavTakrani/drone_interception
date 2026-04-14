@@ -79,6 +79,7 @@ class MPCController:
         # --- Cost weights ---
         self.w_pos = 12.0         # terminal position error
         self.w_vel = 4.0          # terminal velocity penalty
+        self.w_vel_running = 0.0  # running velocity penalty (0 = off by default)
         self.w_tilt = 8.0         # stay upright (terminal)
         self.w_tilt_running = 5.0 # stay upright throughout trajectory
         self.w_yaw = 4.0          # penalise yaw drift
@@ -144,6 +145,7 @@ class MPCController:
         w = np.tile(ang_vel, (N, 1))
 
         all_pos = []
+        all_vel = []
         all_quat = []
         all_ang_vel = []
 
@@ -206,16 +208,17 @@ class MPCController:
             q = q / np.linalg.norm(q, axis=1, keepdims=True)
 
             all_pos.append(p.copy())
+            all_vel.append(v.copy())
             all_quat.append(q.copy())
             all_ang_vel.append(w.copy())
 
-        return p, v, q, w, all_pos, all_quat, all_ang_vel
+        return p, v, q, w, all_pos, all_vel, all_quat, all_ang_vel
 
     # ------------------------------------------------------------------
     # Cost function
     # ------------------------------------------------------------------
     def _compute_costs(self, final_pos, final_vel, final_quat, final_ang_vel,
-                        all_pos, all_quat, all_ang_vel, controls, target):
+                        all_pos, all_vel, all_quat, all_ang_vel, controls, target):
         """Vectorised cost for all N samples."""
         # Terminal position error
         pos_err = final_pos - target[np.newaxis, :]
@@ -240,6 +243,10 @@ class MPCController:
             # Running position
             err = all_pos[t] - target[np.newaxis, :]
             cost += self.w_pos_running * inv_h * np.sum(err ** 2, axis=1)
+
+            # Running velocity — penalise high speed throughout, not just terminal
+            if self.w_vel_running > 0:
+                cost += self.w_vel_running * inv_h * np.sum(all_vel[t] ** 2, axis=1)
 
             # Running tilt — stay upright throughout, not just at the end
             qt = all_quat[t]
@@ -309,14 +316,14 @@ class MPCController:
             samples[:, :, 3] = np.clip(samples[:, :, 3], -self.att_max, self.att_max)
 
             # Forward predict all samples
-            final_pos, final_vel, final_quat, final_ang_vel, all_pos, all_quat, all_ang_vel = self._predict_batch(
+            final_pos, final_vel, final_quat, final_ang_vel, all_pos, all_vel, all_quat, all_ang_vel = self._predict_batch(
                 pos, quat, vel, ang_vel, samples,
             )
 
             # Evaluate cost
             costs = self._compute_costs(
                 final_pos, final_vel, final_quat, final_ang_vel,
-                all_pos, all_quat, all_ang_vel, samples, target,
+                all_pos, all_vel, all_quat, all_ang_vel, samples, target,
             )
 
             # Elite selection & distribution update

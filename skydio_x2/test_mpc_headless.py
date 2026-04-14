@@ -29,6 +29,7 @@ from skydio_x2.intercept_controller import (
     build_intercept_xml,
     compute_lead_point,
 )
+from skydio_x2.intercept_config import InterceptMPCConfig, DEFAULT_INTERCEPT_CONFIG
 from skydio_x2.skydio_x2_movement import (
     create_skydio_x2_simulation,
     apply_motor_mixing,
@@ -306,14 +307,16 @@ def evaluate_mpc(
 def evaluate_intercept(
     target_waypoints,
     target_speed=1.5,
-    intercept_radius=1.2,
+    intercept_radius=1.0,
     max_steps=3000,
-    mpc_horizon=15,
-    mpc_samples=400,
-    mpc_elite=60,
-    mpc_iterations=5,
+    config=None,
 ):
     """Run the intercept controller headlessly and return metrics.
+
+    Parameters
+    ----------
+    config : InterceptMPCConfig or None
+        Weight configuration.  Uses DEFAULT_INTERCEPT_CONFIG when None.
 
     Returns
     -------
@@ -327,6 +330,9 @@ def evaluate_intercept(
         max_tilt_deg      : float
         final_closing_speed : float or None
     """
+    if config is None:
+        config = DEFAULT_INTERCEPT_CONFIG
+
     drone_xml_dir = os.path.join(os.path.dirname(__file__))
     if not os.path.isdir(os.path.join(drone_xml_dir, "assets")):
         drone_xml_dir = os.path.join("skydio_x2")
@@ -348,24 +354,13 @@ def evaluate_intercept(
     hover_thrust = 3.2495625
 
     controller = MPCController(
-        horizon=mpc_horizon,
-        n_samples=mpc_samples,
-        n_elite=mpc_elite,
-        n_iterations=mpc_iterations,
+        horizon=config.horizon,
+        n_samples=config.n_samples,
+        n_elite=config.n_elite,
+        n_iterations=config.n_iterations,
         dt=dt_ctrl,
     )
-    # Intercept weight overrides (same as intercept_controller.py)
-    controller.w_pos = 25.0
-    controller.w_vel = 1.0
-    controller.w_tilt = 10.0
-    controller.w_tilt_running = 8.0
-    controller.w_yaw = 1.0
-    controller.w_pos_running = 8.0
-    controller.w_ang_vel = 4.0
-    controller.w_ang_vel_running = 3.0
-    controller.w_ctrl_rate = 0.5
-    controller.att_max = 0.8
-    controller.thrust_max = 6.0
+    config.apply_to(controller)
 
     target_path = ScriptedTargetPath(target_waypoints, speed=target_speed)
 
@@ -378,6 +373,7 @@ def evaluate_intercept(
     final_closing = None
 
     last_thrust = 0.0
+    phase = "cruise"
 
     for step in range(max_steps):
         # Advance target
@@ -406,16 +402,21 @@ def evaluate_intercept(
             final_closing = np.linalg.norm(drone_vel - target_vel)
             break
 
-        # MPC toward lead point
-        terminal_dist = 0.1
-        if dist > terminal_dist:
-            lead = compute_lead_point(drone_pos, drone_vel, target_pos, target_vel)
-            ctrl = controller.solve(data, lead)
-            thrust_offset, pitch_cmd, roll_cmd, yaw_cmd = ctrl
-            last_thrust = thrust_offset
-        else:
-            thrust_offset = last_thrust
-            pitch_cmd = roll_cmd = yaw_cmd = 0.0
+        # Phase transition
+        xy_dist = np.linalg.norm(drone_pos[:2] - target_pos[:2])
+        if phase == "cruise" and xy_dist <= config.strike_range:
+            phase = "strike"
+            config.apply_strike(controller)
+            controller.reset()
+
+        # MPC toward lead point (strike: aim directly at target)
+        lead = compute_lead_point(drone_pos, drone_vel, target_pos, target_vel)
+        if phase == "strike":
+            lead = target_pos.copy()
+
+        ctrl = controller.solve(data, lead)
+        thrust_offset, pitch_cmd, roll_cmd, yaw_cmd = ctrl
+        last_thrust = thrust_offset
 
         base = hover_thrust + thrust_offset
         apply_motor_mixing(data, pitch_cmd, roll_cmd, yaw_cmd, base)
@@ -682,7 +683,7 @@ def test_intercept():
         r = evaluate_intercept(
             STRAIGHT_PATH,
             target_speed=speed,
-            intercept_radius=1.2,
+            intercept_radius=1.0,
             max_steps=3000,
         )
         tag = f"speed={speed:.0f} m/s"
@@ -699,7 +700,7 @@ def test_intercept():
     r = evaluate_intercept(
         EVASIVE_PATH,
         target_speed=3.0,
-        intercept_radius=1.5,
+        intercept_radius=1.0,
         max_steps=4000,
     )
     if not _print_intercept_result(r, "S-curve at 3 m/s"):
@@ -710,7 +711,7 @@ def test_intercept():
     r = evaluate_intercept(
         ALTITUDE_PATH,
         target_speed=2.5,
-        intercept_radius=1.5,
+        intercept_radius=1.0,
         max_steps=4000,
     )
     if not _print_intercept_result(r, "Altitude path at 2.5 m/s"):
