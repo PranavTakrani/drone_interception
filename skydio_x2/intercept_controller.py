@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from skydio_x2.mpc_controller import MPCController
 from skydio_x2.skydio_x2_movement import apply_motor_mixing
-from skydio_x2.intercept_config import DEFAULT_INTERCEPT_CONFIG
+from skydio_x2.mpc_control_config import DEFAULT_MPC_CONFIG
 
 
 # ======================================================================
@@ -30,30 +30,38 @@ from skydio_x2.intercept_config import DEFAULT_INTERCEPT_CONFIG
 # ======================================================================
 
 def compute_lead_point(drone_pos, drone_vel, target_pos, target_vel,
-                       max_speed=7.0):
-    """Predict where the drone should aim to intercept the target.
-
-    Uses only observable state (position + velocity) — the same information
-    an external sensor would provide.  Lookahead time T is distance-adaptive
-    so the lead point stays close to the target at short range, preventing
-    overshoot.
-    """
+                       max_speed=7.0, drone_speed=None):
+    """Predict where the drone should aim to intercept the target."""
     to_target = target_pos - drone_pos
     dist = np.linalg.norm(to_target)
     if dist < 0.01:
         return target_pos.copy()
 
     los = to_target / dist
-    closing = np.dot(drone_vel - target_vel, los)
+    # Total closing speed: how fast the gap is shrinking
+    total_closing = np.dot(drone_vel, los) - np.dot(target_vel, los)
 
-    # Distance-adaptive max lookahead — shrinks linearly as we close in
-    max_T = np.clip(dist / max_speed, 0.1, 1.5)
+    # Distance-adaptive max lookahead
+    max_T = np.clip(dist / max_speed, 0.05, 1.5)
 
-    effective_speed = max(closing, max_speed * 0.3, 1.5)
-    T = np.clip(dist / effective_speed, 0.05, max_T)
+    effective_closing = max(total_closing, drone_speed if drone_speed is not None else 1.5, 1.5)
+    T = np.clip(dist / effective_closing, 0.0, max_T)
+
+    # Head-on case: target arrives in < 0.6s — aim at current position, not future
+    if total_closing > 0 and (dist / total_closing) < 0.6:
+        T = 0.0
 
     lead = target_pos + target_vel * T
     return lead
+
+
+def predict_target_pos(target_pos, target_vel, horizon, dt):
+    """Extrapolate target position over the MPC horizon (constant-velocity model).
+
+    Gives the MPC a waypoint at where the target will be when the horizon ends —
+    the MPC's own forward model solves how to intercept it.
+    """
+    return target_pos + target_vel * (horizon * dt)
 
 
 # ======================================================================
@@ -139,10 +147,17 @@ def build_intercept_xml(drone_xml_dir, interceptor_pos="0 0 1.5", target_pos="5 
     <!-- ===== TARGET DRONE (scripted, no actuators) ===== -->
     <body name="target" pos="{target_pos}">
       <freejoint name="target_joint"/>
-      <geom type="ellipsoid" size="0.2 0.2 0.08" rgba="1 0.2 0.2 0.9"
-            mass="1.0" contype="1" conaffinity="1"/>
-      <geom type="sphere" size="0.05" pos="0 0 0.1" rgba="1 1 0 1"
-            contype="0" conaffinity="0"/>
+      <geom material="phong3SG" mesh="X2_lowpoly" class="visual" quat="0 0 1 1"
+            rgba="1 0.2 0.2 1"/>
+      <geom class="collision" size=".06 .027 .02" pos=".04 0 .02"/>
+      <geom class="collision" size=".06 .027 .02" pos=".04 0 .06"/>
+      <geom class="collision" size=".05 .027 .02" pos="-.07 0 .065"/>
+      <geom name="rotor1t" class="rotor" pos="-.14 -.18 .05" mass=".25"/>
+      <geom name="rotor2t" class="rotor" pos="-.14 .18 .05" mass=".25"/>
+      <geom name="rotor3t" class="rotor" pos=".14 .18 .08" mass=".25"/>
+      <geom name="rotor4t" class="rotor" pos=".14 -.18 .08" mass=".25"/>
+      <geom size=".16 .04 .02" pos="0 0 0.02" type="ellipsoid" mass=".325"
+            class="visual" material="invisible"/>
     </body>
   </worldbody>
 
@@ -160,7 +175,7 @@ def build_intercept_xml(drone_xml_dir, interceptor_pos="0 0 1.5", target_pos="5 
   </sensor>
 
   <keyframe>
-    <key name="hover" qpos="0 0 1.5 1 0 0 0  5 5 2 1 0 0 0"
+    <key name="hover" qpos="0 0 5.0 1 0 0 0  8 8 6.0 1 0 0 0"
          ctrl="3.2495625 3.2495625 3.2495625 3.2495625"/>
   </keyframe>
 </mujoco>"""
@@ -233,6 +248,8 @@ class RandomEvasiveTarget:
         jink_interval=(0.3, 1.0),
         altitude_range=(1.0, 3.5),
         bounds=((-12, 12), (-12, 12)),
+        bias_pos=None,
+        bias_strength=1.5,
         seed=None,
     ):
         self._rng = np.random.RandomState(seed)
@@ -244,6 +261,8 @@ class RandomEvasiveTarget:
         self.jink_interval = jink_interval
         self.altitude_range = altitude_range
         self.bounds = bounds
+        self.bias_pos = np.array(bias_pos, dtype=np.float64) if bias_pos is not None else None
+        self.bias_strength = bias_strength
 
         # Start with a random horizontal velocity
         angle = self._rng.uniform(0, 2 * np.pi)
@@ -302,6 +321,13 @@ class RandomEvasiveTarget:
             elif self.pos[axis] > hi:
                 self.vel[axis] -= 3.0 * dt
 
+        # Bias toward target location
+        if self.bias_pos is not None:
+            to_bias = self.bias_pos - self.pos
+            dist_bias = np.linalg.norm(to_bias)
+            if dist_bias > 0.5:
+                self.vel += (to_bias / dist_bias) * self.bias_strength * dt
+
         return self.pos.copy(), self.vel.copy()
 
 
@@ -320,6 +346,8 @@ def run_intercept(
     record=False,
     video_out="intercept_recording.mp4",
     target_path_override=None,
+    debug=False,
+    headless=False,
 ):
     """Launch intercept using MPC + lead-point targeting.
 
@@ -356,7 +384,7 @@ def run_intercept(
     dt_ctrl = model.opt.timestep * steps_per_frame
 
     # --- MPC controller — weights loaded from intercept_config.py ---
-    cfg = DEFAULT_INTERCEPT_CONFIG
+    cfg = DEFAULT_MPC_CONFIG
     controller = MPCController(
         horizon=cfg.horizon,
         n_samples=cfg.n_samples,
@@ -420,17 +448,13 @@ def run_intercept(
     last_roll = 0.0
     last_yaw = 0.0
     phase = "cruise"
+    prev_target_pos = None
 
-    with mujoco.viewer.launch_passive(model, data) as viewer:
-        viewer.cam.azimuth = -60
-        viewer.cam.elevation = -30
-        viewer.cam.distance = 10.0
-        viewer.cam.lookat = [2.5, 2.5, 2.0]
-
+    def _run_loop(viewer):
+        nonlocal intercepted, min_dist_seen, last_thrust, last_pitch, last_roll, last_yaw, phase, prev_target_pos
         sim_time = 0.0
-
         try:
-            while viewer.is_running():
+            while (viewer is None or viewer.is_running()):
                 step_start = time.time()
 
                 if sim_time > max_duration:
@@ -439,6 +463,13 @@ def run_intercept(
 
                 # --- Advance target ---
                 target_pos, target_vel = target_path.get_state(dt_ctrl)
+
+                # Fix 7: detect large target jink and reset warm-start
+                if prev_target_pos is not None:
+                    target_accel_est = np.linalg.norm(target_vel - data.qvel[6:9]) / dt_ctrl
+                    if target_accel_est > 8.0:  # m/s² threshold
+                        controller._mean = None  # drop stale warm-start
+                prev_target_pos = target_pos.copy()
 
                 # Kinematic override
                 data.qpos[target_qpos_start:target_qpos_start + 3] = target_pos
@@ -455,9 +486,23 @@ def run_intercept(
                 min_dist_seen = min(min_dist_seen, dist_to_target)
 
                 # Debug: print every timestep with altitude
-                print(f"  t={sim_time:.2f}s  phase={phase:6s}  dist={dist_to_target:.3f}m  "
-                      f"alt={drone_pos[2]:.2f}m  tilt={tilt_deg:.1f}deg  "
-                      f"speed={np.linalg.norm(drone_vel):.2f}m/s")
+                if debug and phase == "strike":
+                    lead_preview = predict_target_pos(target_pos, target_vel,
+                                                      controller.horizon, dt_ctrl)
+                    predicted_target_pos = predict_target_pos(target_pos, target_vel,
+                                                              controller.horizon, dt_ctrl)
+                    dist_force = np.linalg.norm(controller._disturbance_force)
+                    print(
+                        f"  t={sim_time:.2f}s  phase={phase:6s}  dist={dist_to_target:.3f}m\n"
+                        f"    drone_pos          = [{drone_pos[0]:7.3f}, {drone_pos[1]:7.3f}, {drone_pos[2]:7.3f}]\n"
+                        f"    drone_vel          = [{drone_vel[0]:7.3f}, {drone_vel[1]:7.3f}, {drone_vel[2]:7.3f}]  spd={np.linalg.norm(drone_vel):.2f}m/s\n"
+                        f"    target_pos         = [{target_pos[0]:7.3f}, {target_pos[1]:7.3f}, {target_pos[2]:7.3f}]\n"
+                        f"    target_vel         = [{target_vel[0]:7.3f}, {target_vel[1]:7.3f}, {target_vel[2]:7.3f}]  spd={np.linalg.norm(target_vel):.2f}m/s\n"
+                        f"    predicted_tgt_pos  = [{predicted_target_pos[0]:7.3f}, {predicted_target_pos[1]:7.3f}, {predicted_target_pos[2]:7.3f}]\n"
+                        f"    lead_pt            = [{lead[0]:7.3f}, {lead[1]:7.3f}, {lead[2]:7.3f}]\n"
+                        f"    disturbance        = {controller._disturbance_force}  |F|={dist_force:.3f}N\n"
+                        f"    tilt={tilt_deg:.1f}deg  motors=[{data.ctrl[0]:.2f},{data.ctrl[1]:.2f},{data.ctrl[2]:.2f},{data.ctrl[3]:.2f}]"
+                    )
 
                 # --- Check intercept ---
                 if dist_to_target < intercept_radius:
@@ -485,21 +530,36 @@ def run_intercept(
 
                 # --- Two-phase guidance ---
                 # CRUISE: fly flat toward lead point
-                # STRIKE: within strike_range, tilt hard and ram
-                xy_dist = np.linalg.norm(drone_pos[:2] - target_pos[:2])
-                if phase == "cruise" and xy_dist <= cfg.strike_range:
+                # STRIKE: switch when drone is within strike_range of predicted target pos
+                pred_target = predict_target_pos(target_pos, target_vel,
+                                                 controller.horizon * 2, dt_ctrl)
+                dist_to_pred = np.linalg.norm(drone_pos - pred_target)
+                if phase == "cruise" and dist_to_pred <= cfg.strike_range:
                     phase = "strike"
                     cfg.apply_strike(controller)
                     controller.reset()
+                    controller._disturbance_force = np.zeros(3)  # clear stale cruise disturbance
+                    controller._predicted_vel = None
                     print(f"  t={sim_time:.2f}s  STRIKE PHASE  dist={dist_to_target:.2f}m")
 
-                lead = compute_lead_point(drone_pos, drone_vel, target_pos, target_vel)
+                lead = predict_target_pos(target_pos, target_vel,
+                                          controller.horizon * 2, dt_ctrl)
+                # Cap lead distance — don't send drone more than 3m past target
+                lead_offset = lead - target_pos
+                lead_dist = np.linalg.norm(lead_offset)
+                if lead_dist > 3.0:
+                    lead = target_pos + lead_offset * (3.0 / lead_dist)
 
                 if phase == "strike":
-                    # In strike: aim directly at the target, not the lead point
-                    lead = target_pos.copy()
+                    # Use full horizon — need enough lookahead to plan acceleration
+                    lead = predict_target_pos(target_pos, target_vel,
+                                              controller.horizon, dt_ctrl)
+                    # Blend toward current target_pos at close range
+                    blend = np.clip((dist_to_target - 1.5) / 2.5, 0.0, 1.0)
+                    lead = blend * lead + (1.0 - blend) * target_pos
 
-                ctrl = controller.solve(data, lead)
+                ctrl = controller.solve(data, lead,
+                                        target_vel=target_vel if phase == "strike" else None)
                 thrust_offset, pitch_cmd, roll_cmd, yaw_cmd = ctrl
 
                 last_thrust = thrust_offset
@@ -510,43 +570,48 @@ def run_intercept(
                 base = hover_thrust + thrust_offset
                 apply_motor_mixing(data, pitch_cmd, roll_cmd, yaw_cmd, base)
 
-                # --- Physics ---
+                # --- Physics --- pin target first so MuJoCo integrates with correct state
+                data.qpos[target_qpos_start:target_qpos_start + 3] = target_pos
+                data.qpos[target_qpos_start + 3:target_qpos_start + 7] = [1, 0, 0, 0]
+                data.qvel[6:9] = target_vel
+                data.qvel[9:12] = [0, 0, 0]
                 for _ in range(steps_per_frame):
                     mujoco.mj_step(model, data)
                 sim_time += dt_ctrl
 
-                # Re-pin target
+                # Re-pin target after physics to correct any drift
                 data.qpos[target_qpos_start:target_qpos_start + 3] = target_pos
                 data.qpos[target_qpos_start + 3:target_qpos_start + 7] = [1, 0, 0, 0]
                 data.qvel[6:9] = target_vel
                 data.qvel[9:12] = [0, 0, 0]
 
                 # --- Views ---
-                viewer.sync()
+                if not headless:
+                    viewer.sync()
 
-                mujoco.mj_forward(model, data)
-                renderer.update_scene(data, camera=fpv_cam_id)
-                fpv_img = renderer.render()
-                fpv_bgr = cv2.cvtColor(fpv_img, cv2.COLOR_RGB2BGR)
-                fpv_bgr = cv2.flip(fpv_bgr, 0)
+                    mujoco.mj_forward(model, data)
+                    renderer.update_scene(data, camera=fpv_cam_id)
+                    fpv_img = renderer.render()
+                    fpv_bgr = cv2.cvtColor(fpv_img, cv2.COLOR_RGB2BGR)
+                    fpv_bgr = cv2.flip(fpv_bgr, 0)
 
-                phase_color = (0, 255, 0) if phase == "cruise" else (0, 0, 255)
-                cv2.putText(
-                    fpv_bgr,
-                    f"{phase.upper()}  t={sim_time:.1f}s  dist={dist_to_target:.2f}m",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, phase_color, 2,
-                )
-                cv2.putText(
-                    fpv_bgr,
-                    f"lead=[{lead[0]:.1f},{lead[1]:.1f},{lead[2]:.1f}]  "
-                    f"thr={thrust_offset:+.2f}  p={pitch_cmd:+.2f}  r={roll_cmd:+.2f}",
-                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 200), 1,
-                )
-                cv2.imshow("Interceptor FPV", fpv_bgr)
-                cv2.waitKey(1)
+                    phase_color = (0, 255, 0) if phase == "cruise" else (0, 0, 255)
+                    cv2.putText(
+                        fpv_bgr,
+                        f"{phase.upper()}  t={sim_time:.1f}s  dist={dist_to_target:.2f}m",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, phase_color, 2,
+                    )
+                    cv2.putText(
+                        fpv_bgr,
+                        f"lead=[{lead[0]:.1f},{lead[1]:.1f},{lead[2]:.1f}]  "
+                        f"thr={thrust_offset:+.2f}  p={pitch_cmd:+.2f}  r={roll_cmd:+.2f}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 200), 1,
+                    )
+                    cv2.imshow("Interceptor FPV", fpv_bgr)
+                    cv2.waitKey(1)
 
                 # --- Write video frames ---
-                if record:
+                if record and not headless:
                     fpv_writer.write(fpv_bgr)
                     # Third-person: use the same camera angles as the interactive viewer
                     third_person_renderer.update_scene(data)
@@ -569,19 +634,30 @@ def run_intercept(
                         f"min={min_dist_seen:.2f}m"
                     )
 
-                frame_elapsed = time.time() - step_start
-                if frame_elapsed < dt_render:
-                    time.sleep(dt_render - frame_elapsed)
+                if not headless:
+                    frame_elapsed = time.time() - step_start
+                    if frame_elapsed < dt_render:
+                        time.sleep(dt_render - frame_elapsed)
 
         finally:
-            cv2.destroyAllWindows()
-            renderer.close()
-            if record:
-                fpv_writer.release()
-                third_person_writer.release()
-                third_person_renderer.close()
-                print(f"\n  Videos saved.")
+            if not headless:
+                cv2.destroyAllWindows()
+                renderer.close()
+                if record:
+                    fpv_writer.release()
+                    third_person_writer.release()
+                    third_person_renderer.close()
+                    print(f"\n  Videos saved.")
 
+    if headless:
+        _run_loop(None)
+    else:
+        with mujoco.viewer.launch_passive(model, data) as viewer:
+            viewer.cam.azimuth = -60
+            viewer.cam.elevation = -30
+            viewer.cam.distance = 10.0
+            viewer.cam.lookat = [2.5, 2.5, 2.0]
+            _run_loop(viewer)
 
     if intercepted:
         print("Intercept scenario complete — HIT!")
@@ -601,49 +677,74 @@ if __name__ == "__main__":
                         help="Random seed for evasive target (default: random)")
     parser.add_argument("--target-speed", type=float, default=4.0,
                         help="Target max speed in m/s (default: 4.0)")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print per-step debug info: drone pos/vel, target pos/vel, lead point, disturbance")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run without visualization (faster, for batch testing)")
+    parser.add_argument("--iters", type=int, default=1,
+                        help="Number of iterations to run; stops and prints seed on first failure")
     args = parser.parse_args()
 
-    if args.mode == "evasive":
-        seed = args.seed if args.seed is not None else np.random.randint(0, 100000)
-        print(f"  Seed: {seed}")
-        target = RandomEvasiveTarget(
-            start_pos=(8, 8, 2.0),
-            max_speed=args.target_speed,
-            max_accel=3.0,
-            seed=seed,
-        )
-        run_intercept(
-            interceptor_start="0 0 1.5",
-            intercept_radius=1.0,
-            max_duration=45.0,
-            record=args.record,
-            video_out=args.video_out,
-            target_path_override=target,
-        )
-    else:
-        # Figure-S pattern
-        TARGET_PATH = [
-            [10, 10, 2.0],
-            [8, 6, 2.5],
-            [6, 8, 2.0],
-            [4, 4, 2.5],
-            [2, 6, 2.0],
-            [0, 2, 2.5],
-            [-2, 4, 2.0],
-            [-4, 0, 2.5],
-            [-6, 2, 2.0],
-            [-8, -2, 2.5],
-            [-6, -4, 2.0],
-            [-4, -2, 2.5],
-            [-2, -4, 2.0],
-            [0, 0, 2.5],
-        ]
-        run_intercept(
-            target_waypoints=TARGET_PATH,
-            target_speed=args.target_speed,
-            interceptor_start="0 0 1.5",
-            intercept_radius=1.0,
-            max_duration=45.0,
-            record=args.record,
-            video_out=args.video_out,
-        )
+    for iteration in range(args.iters):
+        if args.iters > 1:
+            print(f"\n{'='*60}\n  ITERATION {iteration + 1}/{args.iters}\n{'='*60}")
+
+        if args.mode == "evasive":
+            seed = args.seed if args.seed is not None else np.random.randint(0, 100000)
+            print(f"  Seed: {seed}")
+            target = RandomEvasiveTarget(
+                start_pos=(8, 8, 6.0),
+                max_speed=args.target_speed,
+                max_accel=3.0,
+                bias_pos=(-8, 0, 5.0),
+                bias_strength=2.5,
+                altitude_range=(4.0, 8.0),
+                bounds=((-10, 10), (-10, 10)),
+                seed=seed,
+            )
+            hit = run_intercept(
+                interceptor_start="0 0 5.0",
+                intercept_radius=1.0,
+                max_duration=45.0,
+                record=args.record,
+                video_out=args.video_out,
+                target_path_override=target,
+                debug=args.debug,
+                headless=args.headless,
+            )
+        else:
+            seed = None
+            TARGET_PATH = [
+                [10, 10, 6.0],
+                [8, 6, 6.5],
+                [6, 8, 6.0],
+                [4, 4, 6.5],
+                [2, 6, 6.0],
+                [0, 2, 6.5],
+                [-2, 4, 6.0],
+                [-4, 0, 6.5],
+                [-6, 2, 6.0],
+                [-8, -2, 6.5],
+                [-6, -4, 6.0],
+                [-4, -2, 6.5],
+                [-2, -4, 6.0],
+                [0, 0, 6.5],
+            ]
+            hit = run_intercept(
+                target_waypoints=TARGET_PATH,
+                target_speed=args.target_speed,
+                interceptor_start="0 0 5.0",
+                intercept_radius=1.0,
+                max_duration=45.0,
+                record=args.record,
+                video_out=args.video_out,
+                debug=args.debug,
+                headless=args.headless,
+            )
+
+        if not hit:
+            print(f"\n  FAILED on iteration {iteration + 1}" +
+                  (f"  seed={seed}" if seed is not None else ""))
+            break
+        if args.iters > 1:
+            print(f"  HIT  iteration {iteration + 1}/{args.iters}")

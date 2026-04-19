@@ -102,7 +102,7 @@ class MPCController:
         # unmodelled external force (wind, payload shift, etc.).
         self._disturbance_force = np.zeros(3)  # world-frame force estimate (N)
         self._predicted_vel = None              # velocity predicted last step
-        self._disturbance_alpha = 0.4           # EMA smoothing (0 = ignore, 1 = instant)
+        self._disturbance_alpha = 0.12          # EMA smoothing (0 = ignore, 1 = instant)
 
     # ------------------------------------------------------------------
     # State extraction
@@ -218,14 +218,19 @@ class MPCController:
     # Cost function
     # ------------------------------------------------------------------
     def _compute_costs(self, final_pos, final_vel, final_quat, final_ang_vel,
-                        all_pos, all_vel, all_quat, all_ang_vel, controls, target):
+                        all_pos, all_vel, all_quat, all_ang_vel, controls, target,
+                        target_vel=None):
         """Vectorised cost for all N samples."""
         # Terminal position error
         pos_err = final_pos - target[np.newaxis, :]
         cost = self.w_pos * np.sum(pos_err ** 2, axis=1)
 
-        # Terminal velocity (want to arrive with low speed)
-        cost += self.w_vel * np.sum(final_vel ** 2, axis=1)
+        # Terminal velocity — penalise velocity relative to target if provided
+        if target_vel is not None:
+            rel_vel = final_vel - target_vel[np.newaxis, :]
+        else:
+            rel_vel = final_vel
+        cost += self.w_vel * np.sum(rel_vel ** 2, axis=1)
 
         # Terminal uprightness  (qw² + qz² = 1 for pure yaw, penalise pitch/roll)
         tilt_err = final_quat[:, 1] ** 2 + final_quat[:, 2] ** 2  # qx² + qy²
@@ -244,9 +249,10 @@ class MPCController:
             err = all_pos[t] - target[np.newaxis, :]
             cost += self.w_pos_running * inv_h * np.sum(err ** 2, axis=1)
 
-            # Running velocity — penalise high speed throughout, not just terminal
+            # Running velocity — penalise high speed relative to target
             if self.w_vel_running > 0:
-                cost += self.w_vel_running * inv_h * np.sum(all_vel[t] ** 2, axis=1)
+                rv = all_vel[t] - target_vel[np.newaxis, :] if target_vel is not None else all_vel[t]
+                cost += self.w_vel_running * inv_h * np.sum(rv ** 2, axis=1)
 
             # Running tilt — stay upright throughout, not just at the end
             qt = all_quat[t]
@@ -269,20 +275,11 @@ class MPCController:
     # ------------------------------------------------------------------
     # CEM optimisation
     # ------------------------------------------------------------------
-    def solve(self, data, target_pos):
-        """Run CEM and return the first-step control.
-
-        Parameters
-        ----------
-        data       : MuJoCo MjData
-        target_pos : array-like (3,)  desired [x, y, z]
-
-        Returns
-        -------
-        ctrl : ndarray (4,)  [thrust_offset, pitch_cmd, roll_cmd, yaw_cmd]
-        """
+    def solve(self, data, target_pos, target_vel=None):
+        """Run CEM and return the first-step control."""
         pos, quat, vel, ang_vel = self.get_state(data)
         target = np.asarray(target_pos, dtype=np.float64)
+        tv = np.asarray(target_vel, dtype=np.float64) if target_vel is not None else None
 
         # --- Disturbance estimation ---
         # If we predicted a velocity last step, compare it to the actual
@@ -292,9 +289,11 @@ class MPCController:
         # to the true external force:  d_new = d_old + alpha * residual
         # (standard EMA: d = (1-a)*d + a*wind  rearranges to d += a*(wind-d))
         if self._predicted_vel is not None:
-            vel_error = vel - self._predicted_vel  # (3,)
+            vel_error = vel - self._predicted_vel
             force_residual = vel_error * self.mass / self.dt
-            self._disturbance_force += self._disturbance_alpha * force_residual
+            # Freeze estimator if force is already large — prevents runaway
+            if np.linalg.norm(self._disturbance_force) < 3.0:
+                self._disturbance_force += self._disturbance_alpha * force_residual
 
         # Initialise / warm-start the sampling distribution
         if self._mean is None:
@@ -324,6 +323,7 @@ class MPCController:
             costs = self._compute_costs(
                 final_pos, final_vel, final_quat, final_ang_vel,
                 all_pos, all_vel, all_quat, all_ang_vel, samples, target,
+                target_vel=tv,
             )
 
             # Elite selection & distribution update
