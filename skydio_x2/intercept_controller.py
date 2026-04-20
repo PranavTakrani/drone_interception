@@ -547,8 +547,8 @@ def run_intercept(
                 # Cap lead distance — don't send drone more than 3m past target
                 lead_offset = lead - target_pos
                 lead_dist = np.linalg.norm(lead_offset)
-                if lead_dist > 3.0:
-                    lead = target_pos + lead_offset * (3.0 / lead_dist)
+                if lead_dist > 5.0:
+                    lead = target_pos + lead_offset * (5.0 / lead_dist)
 
                 if phase == "strike":
                     # Use full horizon — need enough lookahead to plan acceleration

@@ -19,8 +19,8 @@ class MPCControlConfig:
 
     # --- CRUISE phase ---
     cruise_w_pos: float = 20.0
-    cruise_w_vel: float = 8.0
-    cruise_w_vel_running: float = 1.0
+    cruise_w_vel: float = 2.0
+    cruise_w_vel_running: float = 0.0
     cruise_w_pos_running: float = 8.0
     cruise_w_tilt: float = 4.0
     cruise_w_tilt_running: float = 3.0

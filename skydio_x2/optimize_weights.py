@@ -1,22 +1,22 @@
 """
-optimize_weights.py -- Intercept diagnostic harness.
+optimize_weights.py -- Overnight weight optimizer for the intercept MPC.
 
-Runs the intercept controller across diverse target paths and prints
-per-frame telemetry so you can see exactly where and why things go wrong
-(overshoot, lead-point error, velocity buildup, etc.).
+Runs random search over the weight space, evaluating each candidate on a
+batch of random seeds. Saves the best config found to a JSON file.
 
 Usage:
-    python skydio_x2/optimize_weights.py                              # all scenarios
-    python skydio_x2/optimize_weights.py --scenario straight          # one scenario
-    python skydio_x2/optimize_weights.py --scenario evasive           # random evasive target
-    python skydio_x2/optimize_weights.py --scenario evasive --visualize  # with viewer
-    python skydio_x2/optimize_weights.py --config tuned.json          # custom weights
+    python skydio_x2/optimize_weights.py
+    python skydio_x2/optimize_weights.py --trials 500 --seeds-per-trial 10
+    python skydio_x2/optimize_weights.py --out best_weights.json
+    python skydio_x2/optimize_weights.py --resume best_weights.json  # warm-start
 """
 
 import argparse
+import json
 import os
 import sys
 import time
+import copy
 
 import numpy as np
 import mujoco
@@ -24,107 +24,87 @@ import mujoco
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from skydio_x2.mpc_controller import MPCController
+from skydio_x2.mpc_control_config import MPCControlConfig, DEFAULT_MPC_CONFIG
 from skydio_x2.intercept_controller import (
-    ScriptedTargetPath,
     RandomEvasiveTarget,
+    ScriptedTargetPath,
     build_intercept_xml,
-    compute_lead_point,
-    run_intercept,
+    predict_target_pos,
 )
-from skydio_x2.intercept_config import InterceptMPCConfig, DEFAULT_INTERCEPT_CONFIG
 from skydio_x2.skydio_x2_movement import apply_motor_mixing
 
 
 # ======================================================================
-# Test scenarios — diverse path types
+# Search space — (min, max, log_scale)
 # ======================================================================
-
-SCENARIOS = {
-    "straight": {
-        "waypoints": [[5, 5, 2.0], [5, -5, 2.0]],
-        "speed": 3.0,
-        "desc": "Straight line — baseline, should always hit",
-    },
-    "straight_fast": {
-        "waypoints": [[5, 5, 2.0], [5, -5, 2.0]],
-        "speed": 6.0,
-        "desc": "Fast straight line — tests closing speed",
-    },
-    "scurve": {
-        "waypoints": [
-            [8, 8, 2.0], [6, 4, 2.5], [4, 6, 2.0],
-            [2, 2, 2.5], [0, 4, 2.0], [-2, 0, 2.5],
-        ],
-        "speed": 4.0,
-        "desc": "Evasive S-curve — tests turn tracking",
-    },
-    "altitude": {
-        "waypoints": [
-            [6, 0, 1.5], [6, 4, 3.5], [2, 4, 1.0],
-            [2, 0, 3.0], [0, 0, 2.0],
-        ],
-        "speed": 2.5,
-        "desc": "Altitude changes — tests 3D tracking",
-    },
-    "figure_s": {
-        "waypoints": [
-            [10, 10, 2.0], [8, 6, 2.5], [6, 8, 2.0], [4, 4, 2.5],
-            [2, 6, 2.0], [0, 2, 2.5], [-2, 4, 2.0], [-4, 0, 2.5],
-        ],
-        "speed": 4.0,
-        "desc": "Figure-S at speed — the hard case",
-    },
-    "evasive": {
-        "type": "random",
-        "start_pos": [8, 8, 2.0],
-        "speed": 4.0,
-        "max_accel": 3.0,
-        "seed": 42,
-        "desc": "Random evasive — realistic unpredictable drone",
-    },
+SEARCH_SPACE = {
+    # cruise
+    "cruise_w_pos":          (5.0,  40.0,  True),
+    "cruise_w_vel":          (0.0,  10.0,  False),
+    "cruise_w_pos_running":  (1.0,  20.0,  True),
+    "cruise_w_tilt":         (0.5,  10.0,  True),
+    "cruise_w_tilt_running": (0.5,  10.0,  True),
+    "cruise_att_max":        (0.5,   1.4,  False),
+    "cruise_thrust_max":     (4.0,  12.0,  False),
+    # strike
+    "strike_w_pos":          (20.0, 100.0, True),
+    "strike_w_vel":          (0.0,  10.0,  False),
+    "strike_w_pos_running":  (0.0,  20.0,  False),
+    "strike_w_tilt":         (0.0,   5.0,  False),
+    "strike_att_max":        (0.6,   1.4,  False),
+    "strike_thrust_max":     (6.0,  13.0,  False),
+    # phase transition
+    "strike_range":          (2.0,   7.0,  False),
 }
 
 
+def sample_config(rng, base: MPCControlConfig = None, noise_scale: float = 1.0) -> MPCControlConfig:
+    """Sample a random config, optionally perturbing around a base config."""
+    cfg = copy.deepcopy(DEFAULT_MPC_CONFIG)
+    for key, (lo, hi, log) in SEARCH_SPACE.items():
+        if base is not None:
+            # Perturb around base value
+            base_val = getattr(base, key)
+            if log and base_val > 0:
+                log_lo, log_hi = np.log(lo), np.log(hi)
+                log_base = np.log(base_val)
+                span = (log_hi - log_lo) * noise_scale * 0.3
+                val = np.exp(np.clip(rng.normal(log_base, span), log_lo, log_hi))
+            else:
+                span = (hi - lo) * noise_scale * 0.3
+                val = np.clip(rng.normal(base_val, span), lo, hi)
+        else:
+            if log:
+                val = np.exp(rng.uniform(np.log(lo), np.log(hi)))
+            else:
+                val = rng.uniform(lo, hi)
+        setattr(cfg, key, float(val))
+    return cfg
+
+
 # ======================================================================
-# Diagnostic runner
+# Single trial runner (headless)
 # ======================================================================
 
-def run_diagnostic(scenario_name, config, intercept_radius=1.0, max_time=30.0):
-    """Run one intercept scenario and return per-frame telemetry.
+def run_trial(cfg: MPCControlConfig, seed: int, max_time: float = 30.0,
+              intercept_radius: float = 1.0) -> dict:
+    """Run one headless intercept trial. Returns dict with hit, min_dist, time."""
+    rng = np.random.RandomState(seed)
 
-    Returns a dict with:
-        hit           : bool
-        time          : float or None
-        min_dist      : float
-        max_speed     : float
-        max_tilt      : float
-        frames        : list of per-frame dicts
-    """
-    sc = SCENARIOS[scenario_name]
-
-    # Build the target path object
-    is_random = sc.get("type") == "random"
-    if is_random:
-        target_path = RandomEvasiveTarget(
-            start_pos=sc["start_pos"],
-            max_speed=sc["speed"],
-            max_accel=sc["max_accel"],
-            seed=sc.get("seed"),
-        )
-        start_pos = sc["start_pos"]
-    else:
-        waypoints = sc["waypoints"]
-        target_path = ScriptedTargetPath(waypoints, speed=sc["speed"])
-        start_pos = waypoints[0]
-
-    drone_xml_dir = os.path.join(os.path.dirname(__file__))
-    if not os.path.isdir(os.path.join(drone_xml_dir, "assets")):
-        drone_xml_dir = os.path.join("skydio_x2")
-    drone_xml_dir = os.path.abspath(drone_xml_dir)
-
-    xml = build_intercept_xml(
-        drone_xml_dir, "0 0 1.5", f"{start_pos[0]} {start_pos[1]} {start_pos[2]}"
+    target = RandomEvasiveTarget(
+        start_pos=(8, 8, 6.0),
+        max_speed=4.0,
+        max_accel=3.0,
+        bias_pos=(-8, 0, 5.0),
+        bias_strength=2.5,
+        altitude_range=(4.0, 8.0),
+        bounds=((-10, 10), (-10, 10)),
+        seed=seed,
     )
+
+    drone_xml_dir = os.path.abspath(os.path.dirname(__file__))
+    xml = build_intercept_xml(drone_xml_dir, "0 0 5.0",
+                              f"{target.pos[0]} {target.pos[1]} {target.pos[2]}")
     model = mujoco.MjModel.from_xml_string(xml)
     data = mujoco.MjData(model)
     if model.nkey > 0:
@@ -133,280 +113,229 @@ def run_diagnostic(scenario_name, config, intercept_radius=1.0, max_time=30.0):
     steps_per_frame = 4
     dt_ctrl = model.opt.timestep * steps_per_frame
     hover_thrust = 3.2495625
+    target_qpos_start = 7
 
     controller = MPCController(
-        horizon=config.horizon,
-        n_samples=config.n_samples,
-        n_elite=config.n_elite,
-        n_iterations=config.n_iterations,
+        horizon=cfg.horizon,
+        n_samples=cfg.n_samples,
+        n_elite=cfg.n_elite,
+        n_iterations=cfg.n_iterations,
         dt=dt_ctrl,
     )
-    config.apply_to(controller)
+    cfg.apply_to(controller)
 
     max_steps = int(max_time / dt_ctrl)
-
-    frames = []
     min_dist = float("inf")
-    max_speed = 0.0
-    max_tilt = 0.0
-    last_thrust = 0.0
-    hit = False
-    hit_time = None
     phase = "cruise"
+    prev_target_pos = None
 
     for step in range(max_steps):
-        sim_time = step * dt_ctrl
+        target_pos, target_vel = target.get_state(dt_ctrl)
 
-        tpos, tvel = target_path.get_state(dt_ctrl)
-        data.qpos[7:10] = tpos
-        data.qpos[10:14] = [1, 0, 0, 0]
-        data.qvel[6:9] = tvel
+        # Jink detection
+        if prev_target_pos is not None:
+            accel_est = np.linalg.norm(target_vel - data.qvel[6:9]) / dt_ctrl
+            if accel_est > 8.0:
+                controller._mean = None
+        prev_target_pos = target_pos.copy()
+
+        # Pin target
+        data.qpos[target_qpos_start:target_qpos_start + 3] = target_pos
+        data.qpos[target_qpos_start + 3:target_qpos_start + 7] = [1, 0, 0, 0]
+        data.qvel[6:9] = target_vel
         data.qvel[9:12] = [0, 0, 0]
 
-        dpos = data.qpos[:3].copy()
-        dvel = data.qvel[:3].copy()
-        quat = data.qpos[3:7].copy()
-
-        dist = np.linalg.norm(dpos - tpos)
-        speed = np.linalg.norm(dvel)
-        tilt = np.degrees(
-            2.0 * np.arcsin(np.clip(np.sqrt(quat[1] ** 2 + quat[2] ** 2), 0, 1))
-        )
-
+        drone_pos = data.qpos[:3].copy()
+        drone_vel = data.qvel[:3].copy()
+        dist = np.linalg.norm(drone_pos - target_pos)
         min_dist = min(min_dist, dist)
-        max_speed = max(max_speed, speed)
-        max_tilt = max(max_tilt, tilt)
-
-        # Phase transition
-        xy_dist = np.linalg.norm(dpos[:2] - tpos[:2])
-        if phase == "cruise" and xy_dist <= config.strike_range:
-            phase = "strike"
-            config.apply_strike(controller)
-            controller.reset()
-
-        # Compute lead point for diagnostics
-        lead = compute_lead_point(dpos, dvel, tpos, tvel)
-        if phase == "strike":
-            lead = tpos.copy()
-        lead_err = np.linalg.norm(lead - tpos)
-
-        # Log every 10th frame to keep output manageable
-        if step % 10 == 0:
-            # Angle between drone velocity and direction to target
-            to_tgt = tpos - dpos
-            to_tgt_dist = np.linalg.norm(to_tgt)
-            if to_tgt_dist > 0.01 and speed > 0.1:
-                cos_ang = np.dot(dvel, to_tgt) / (speed * to_tgt_dist)
-                heading_err = np.degrees(np.arccos(np.clip(cos_ang, -1, 1)))
-            else:
-                heading_err = 0.0
-
-            frames.append({
-                "t": sim_time,
-                "dist": dist,
-                "speed": speed,
-                "tilt": tilt,
-                "lead_err": lead_err,
-                "heading_err": heading_err,
-                "closing": np.dot(dvel - tvel, (tpos - dpos) / max(dist, 0.01)),
-                "phase": phase,
-            })
 
         if dist < intercept_radius:
-            hit = True
-            hit_time = sim_time
-            break
+            return {"hit": True, "min_dist": min_dist, "time": step * dt_ctrl}
 
-        ctrl = controller.solve(data, lead)
+        # Phase transition using predicted pos
+        pred_target = predict_target_pos(target_pos, target_vel,
+                                         controller.horizon * 2, dt_ctrl)
+        dist_to_pred = np.linalg.norm(drone_pos - pred_target)
+        if phase == "cruise" and dist_to_pred <= cfg.strike_range:
+            phase = "strike"
+            cfg.apply_strike(controller)
+            controller._disturbance_force = np.zeros(3)
+            controller._predicted_vel = None
+            controller.reset()
+
+        # Lead point
+        lead = predict_target_pos(target_pos, target_vel,
+                                   controller.horizon * 2, dt_ctrl)
+        lead_offset = lead - target_pos
+        lead_dist = np.linalg.norm(lead_offset)
+        if lead_dist > 5.0:
+            lead = target_pos + lead_offset * (5.0 / lead_dist)
+
+        if phase == "strike":
+            lead = predict_target_pos(target_pos, target_vel,
+                                       controller.horizon, dt_ctrl)
+            blend = np.clip((dist - 1.5) / 2.5, 0.0, 1.0)
+            lead = blend * lead + (1.0 - blend) * target_pos
+
+        ctrl = controller.solve(data, lead,
+                                target_vel=target_vel if phase == "strike" else None)
         t_off, p_cmd, r_cmd, y_cmd = ctrl
-        last_thrust = t_off
 
         apply_motor_mixing(data, p_cmd, r_cmd, y_cmd, hover_thrust + t_off)
 
+        data.qpos[target_qpos_start:target_qpos_start + 3] = target_pos
+        data.qpos[target_qpos_start + 3:target_qpos_start + 7] = [1, 0, 0, 0]
+        data.qvel[6:9] = target_vel
+        data.qvel[9:12] = [0, 0, 0]
         for _ in range(steps_per_frame):
             mujoco.mj_step(model, data)
 
-        data.qpos[7:10] = tpos
-        data.qpos[10:14] = [1, 0, 0, 0]
-        data.qvel[6:9] = tvel
+        data.qpos[target_qpos_start:target_qpos_start + 3] = target_pos
+        data.qpos[target_qpos_start + 3:target_qpos_start + 7] = [1, 0, 0, 0]
+        data.qvel[6:9] = target_vel
         data.qvel[9:12] = [0, 0, 0]
 
+        # Reset phase for next trial if needed
+        if phase == "strike" and dist > cfg.strike_range * 2:
+            phase = "cruise"
+            cfg.apply_cruise(controller)
+
+    return {"hit": False, "min_dist": min_dist, "time": None}
+
+
+# ======================================================================
+# Score function
+# ======================================================================
+
+def score_config(cfg: MPCControlConfig, seeds: list, max_time: float) -> dict:
+    """Evaluate config on multiple seeds. Returns score dict."""
+    hits = 0
+    min_dists = []
+    times = []
+
+    for seed in seeds:
+        try:
+            r = run_trial(cfg, seed, max_time=max_time)
+        except Exception:
+            r = {"hit": False, "min_dist": 99.0, "time": None}
+
+        if r["hit"]:
+            hits += 1
+            times.append(r["time"])
+        min_dists.append(r["min_dist"])
+
+    hit_rate = hits / len(seeds)
+    avg_min_dist = float(np.mean(min_dists))
+    avg_time = float(np.mean(times)) if times else max_time
+
+    # Score: maximize hit rate, then minimize time, then minimize miss distance
+    score = hit_rate * 1000.0 - avg_time * 0.5 - avg_min_dist * 2.0
+
     return {
-        "hit": hit,
-        "time": hit_time,
-        "min_dist": min_dist,
-        "max_speed": max_speed,
-        "max_tilt": max_tilt,
-        "frames": frames,
+        "score": score,
+        "hit_rate": hit_rate,
+        "avg_min_dist": avg_min_dist,
+        "avg_time": avg_time,
+        "hits": hits,
+        "n": len(seeds),
     }
 
 
 # ======================================================================
-# Display
-# ======================================================================
-
-def print_diagnostic(scenario_name, result):
-    sc = SCENARIOS[scenario_name]
-    status = "HIT" if result["hit"] else "MISS"
-    t_str = f'{result["time"]:.2f}s' if result["hit"] else "N/A"
-
-    print(f"\n{'=' * 72}")
-    print(f"  {scenario_name:15s}  [{status}]  t={t_str}  "
-          f"min_d={result['min_dist']:.3f}m  "
-          f"max_spd={result['max_speed']:.1f}m/s  "
-          f"max_tilt={result['max_tilt']:.1f}deg")
-    print(f"  {sc['desc']}")
-    if sc.get("type") == "random":
-        print(f"  max_speed={sc['speed']}m/s  max_accel={sc['max_accel']}m/s^2")
-    else:
-        print(f"  target_speed={sc['speed']}m/s  waypoints={len(sc['waypoints'])}")
-    print(f"{'=' * 72}")
-
-    # Column headers
-    print(f"  {'t':>5s}  {'phase':>6s}  {'dist':>6s}  {'speed':>5s}  {'close':>6s}  "
-          f"{'lead_e':>6s}  {'head_e':>6s}  {'tilt':>5s}  notes")
-    print(f"  {'---':>5s}  {'---':>6s}  {'---':>6s}  {'---':>5s}  {'---':>6s}  "
-          f"{'---':>6s}  {'---':>6s}  {'---':>5s}  ---")
-
-    for f in result["frames"]:
-        notes = []
-        if f["speed"] > 8.0:
-            notes.append("HIGH SPEED")
-        if f["heading_err"] > 60.0 and f["dist"] < 5.0:
-            notes.append("OFF HEADING")
-        if f["closing"] < 0 and f["dist"] < 5.0:
-            notes.append("DIVERGING")
-        if f["lead_err"] > 3.0:
-            notes.append("LEAD FAR")
-        if f["tilt"] > 50.0:
-            notes.append("STEEP TILT")
-
-        note_str = "  ".join(notes)
-        ph = f.get("phase", "?")[:6]
-        print(f"  {f['t']:5.2f}  {ph:>6s}  {f['dist']:6.2f}  {f['speed']:5.2f}  "
-              f"{f['closing']:+6.2f}  {f['lead_err']:6.2f}  "
-              f"{f['heading_err']:6.1f}  {f['tilt']:5.1f}  {note_str}")
-
-
-def print_summary(results):
-    print(f"\n{'=' * 72}")
-    print(f"  SUMMARY")
-    print(f"{'=' * 72}")
-    print(f"  {'scenario':15s}  {'result':>6s}  {'time':>7s}  {'min_d':>6s}  "
-          f"{'max_spd':>7s}  {'max_tilt':>8s}")
-    for name, r in results.items():
-        status = "HIT" if r["hit"] else "MISS"
-        t_str = f'{r["time"]:.2f}s' if r["hit"] else "---"
-        print(f"  {name:15s}  {status:>6s}  {t_str:>7s}  "
-              f"{r['min_dist']:6.3f}  {r['max_speed']:7.1f}  {r['max_tilt']:8.1f}")
-
-    hits = sum(1 for r in results.values() if r["hit"])
-    print(f"\n  {hits}/{len(results)} intercepted")
-    print(f"{'=' * 72}\n")
-
-
-# ======================================================================
-# Main
+# Main optimizer
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Intercept diagnostic harness")
-    parser.add_argument(
-        "--scenario", choices=list(SCENARIOS.keys()),
-        help="Run a single scenario (default: all)",
-    )
-    parser.add_argument(
-        "--config", default=None,
-        help="Load weights from JSON file (default: use intercept_config defaults)",
-    )
-    parser.add_argument(
-        "--max-time", type=float, default=30.0,
-        help="Max sim time per scenario in seconds (default: 30)",
-    )
-    parser.add_argument(
-        "--radius", type=float, default=0.5,
-        help="Intercept radius in metres (default: 0.5)",
-    )
-    parser.add_argument(
-        "--visualize", action="store_true",
-        help="Launch MuJoCo viewer + FPV window (single scenario only)",
-    )
-    parser.add_argument(
-        "--seed", type=int, default=None,
-        help="Override random seed for evasive scenario",
-    )
+    parser = argparse.ArgumentParser(description="MPC weight optimizer")
+    parser.add_argument("--trials", type=int, default=200,
+                        help="Number of random configs to try (default: 200)")
+    parser.add_argument("--seeds-per-trial", type=int, default=8,
+                        help="Seeds evaluated per config (default: 8)")
+    parser.add_argument("--max-time", type=float, default=30.0,
+                        help="Max sim time per trial in seconds (default: 30)")
+    parser.add_argument("--out", default="skydio_x2/best_weights.json",
+                        help="Output path for best config (default: skydio_x2/best_weights.json)")
+    parser.add_argument("--resume", default=None,
+                        help="Resume from existing best config JSON")
+    parser.add_argument("--exploit-ratio", type=float, default=0.5,
+                        help="Fraction of trials that perturb best vs random (default: 0.5)")
     args = parser.parse_args()
 
-    if args.config:
-        config = InterceptMPCConfig.from_json(args.config)
-        print(f"  Loaded config from {args.config}")
+    rng = np.random.RandomState(0)
+
+    # Fixed evaluation seeds — same across all trials for fair comparison
+    eval_seeds = list(range(args.seeds_per_trial))
+
+    # Load or init best config
+    if args.resume and os.path.exists(args.resume):
+        best_cfg = MPCControlConfig.from_json(args.resume)
+        print(f"Resumed from {args.resume}")
     else:
-        config = DEFAULT_INTERCEPT_CONFIG
+        best_cfg = copy.deepcopy(DEFAULT_MPC_CONFIG)
 
-    print(f"\n  Weights:")
-    print(f"    w_pos={config.w_pos}  w_vel={config.w_vel}  "
-          f"w_vel_run={config.w_vel_running}  w_pos_run={config.w_pos_running}")
-    print(f"    att_max={config.att_max}  thrust_max={config.thrust_max}")
-    print(f"    horizon={config.horizon}  samples={config.n_samples}")
+    # Score the starting config
+    print(f"\nScoring baseline config on {args.seeds_per_trial} seeds...")
+    best_result = score_config(best_cfg, eval_seeds, args.max_time)
+    best_score = best_result["score"]
+    print(f"  Baseline: score={best_score:.2f}  hit_rate={best_result['hit_rate']:.0%}  "
+          f"avg_min_dist={best_result['avg_min_dist']:.3f}m  "
+          f"avg_time={best_result['avg_time']:.1f}s")
 
-    # --visualize: launch the full viewer for a single scenario
-    if args.visualize:
-        if not args.scenario:
-            print("\n  --visualize requires --scenario. Pick one:")
-            for name in SCENARIOS:
-                print(f"    {name}")
-            sys.exit(1)
+    print(f"\nStarting {args.trials} trials ({args.seeds_per_trial} seeds each)...\n")
+    t_start = time.time()
 
-        sc = SCENARIOS[args.scenario]
-        is_random = sc.get("type") == "random"
-
-        if is_random:
-            seed = args.seed if args.seed is not None else sc.get("seed")
-            target = RandomEvasiveTarget(
-                start_pos=sc["start_pos"],
-                max_speed=sc["speed"],
-                max_accel=sc["max_accel"],
-                seed=seed,
-            )
-            print(f"\n  Launching viewer: {args.scenario} (seed={seed})")
-            run_intercept(
-                interceptor_start="0 0 1.5",
-                intercept_radius=args.radius,
-                max_duration=args.max_time,
-                target_path_override=target,
-            )
+    for trial in range(args.trials):
+        # Exploit best or explore randomly
+        if rng.random() < args.exploit_ratio:
+            noise = max(0.3, 1.0 - trial / args.trials)  # anneal noise
+            cfg = sample_config(rng, base=best_cfg, noise_scale=noise)
         else:
-            print(f"\n  Launching viewer: {args.scenario}")
-            run_intercept(
-                target_waypoints=sc["waypoints"],
-                target_speed=sc["speed"],
-                interceptor_start="0 0 1.5",
-                intercept_radius=args.radius,
-                max_duration=args.max_time,
-            )
-        return
+            cfg = sample_config(rng)
 
-    # Headless diagnostics
-    if args.scenario:
-        scenarios = {args.scenario: SCENARIOS[args.scenario]}
-    else:
-        scenarios = SCENARIOS
+        result = score_config(cfg, eval_seeds, args.max_time)
 
-    results = {}
-    for name in scenarios:
-        t0 = time.time()
-        result = run_diagnostic(
-            name, config,
-            intercept_radius=args.radius,
-            max_time=args.max_time,
-        )
-        elapsed = time.time() - t0
-        results[name] = result
-        print_diagnostic(name, result)
-        print(f"  ({elapsed:.1f}s)")
+        elapsed = time.time() - t_start
+        eta = elapsed / (trial + 1) * (args.trials - trial - 1)
 
-    if len(results) > 1:
-        print_summary(results)
+        improved = result["score"] > best_score
+        marker = " ***" if improved else ""
+
+        # Progress bar
+        bar_width = 30
+        filled = int(bar_width * (trial + 1) / args.trials)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        pct = (trial + 1) / args.trials * 100
+        print(f"\r  [{bar}] {pct:5.1f}%  "
+              f"score={result['score']:7.2f}  "
+              f"hit={result['hit_rate']:.0%}  "
+              f"best={best_score:.2f}  "
+              f"eta={eta/60:.1f}min{marker}",
+              end="", flush=True)
+
+        if improved:
+            best_score = result["score"]
+            best_cfg = cfg
+            best_result = result
+            best_cfg.to_json(args.out)
+            print(f"\n    *** New best: score={best_score:.2f}  "
+                  f"hit={best_result['hit_rate']:.0%}  "
+                  f"min_d={best_result['avg_min_dist']:.3f}m  "
+                  f"-> {args.out}")
+
+    print(f"\n{'='*60}")
+    print(f"  OPTIMIZATION COMPLETE")
+    print(f"  Best score:    {best_score:.2f}")
+    print(f"  Hit rate:      {best_result['hit_rate']:.0%} ({best_result['hits']}/{best_result['n']})")
+    print(f"  Avg min dist:  {best_result['avg_min_dist']:.3f}m")
+    print(f"  Avg time:      {best_result['avg_time']:.1f}s")
+    print(f"  Saved to:      {args.out}")
+    print(f"{'='*60}\n")
+
+    # Print the winning config
+    print("Best config:")
+    for key in SEARCH_SPACE:
+        print(f"  {key} = {getattr(best_cfg, key):.4f}")
 
 
 if __name__ == "__main__":
