@@ -2,7 +2,7 @@
 intercept_controller.py — Intercept a moving target using the MPC waypoint controller.
 
 Strategy: compute a lead intercept point each frame and feed it to the existing
-MPCController as a continuously-updating waypoint. The MPC handles all the
+MPPIController as a continuously-updating waypoint. The MPPI controller handles all the
 attitude/thrust control (which it already does well for static waypoints).
 
 Usage:
@@ -17,12 +17,15 @@ import cv2
 import time
 import os
 import sys
+import warnings                                                         
+warnings.filterwarnings("ignore", message="Could not import matplotlib")
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from skydio_x2.mpc_controller import MPCController
+from skydio_x2.mppi_controller import MPPIController
 from skydio_x2.skydio_x2_movement import apply_motor_mixing
-from skydio_x2.mpc_control_config import DEFAULT_MPC_CONFIG
+from skydio_x2.mpc_control_config import DEFAULT_MPPI_CONFIG
+from skydio_x2.optimize_weights_mppi import MPPIControlConfig
 
 
 # ======================================================================
@@ -31,28 +34,22 @@ from skydio_x2.mpc_control_config import DEFAULT_MPC_CONFIG
 
 def compute_lead_point(drone_pos, drone_vel, target_pos, target_vel,
                        max_speed=7.0, drone_speed=None):
-    """Predict where the drone should aim to intercept the target."""
-    to_target = target_pos - drone_pos
-    dist = np.linalg.norm(to_target)
+    """Simple lead point: aim ahead of target by at most 1 second of its travel."""
+    dist = np.linalg.norm(target_pos - drone_pos)
     if dist < 0.01:
         return target_pos.copy()
 
-    los = to_target / dist
-    # Total closing speed: how fast the gap is shrinking
-    total_closing = np.dot(drone_vel, los) - np.dot(target_vel, los)
+    speed = max(drone_speed if drone_speed is not None else 2.0, 2.0)
+    target_spd = np.linalg.norm(target_vel)
 
-    # Distance-adaptive max lookahead
-    max_T = np.clip(dist / max_speed, 0.05, 1.5)
+    # Time to reach target at current speed, capped to 1s
+    T = min(dist / speed, 1.0)
 
-    effective_closing = max(total_closing, drone_speed if drone_speed is not None else 1.5, 1.5)
-    T = np.clip(dist / effective_closing, 0.0, max_T)
+    # Further cap: lead offset can't exceed half the current distance
+    if target_spd > 0:
+        T = min(T, (dist * 0.5) / target_spd)
 
-    # Head-on case: target arrives in < 0.6s — aim at current position, not future
-    if total_closing > 0 and (dist / total_closing) < 0.6:
-        T = 0.0
-
-    lead = target_pos + target_vel * T
-    return lead
+    return target_pos + target_vel * T
 
 
 def predict_target_pos(target_pos, target_vel, horizon, dt):
@@ -383,13 +380,11 @@ def run_intercept(
     steps_per_frame = 4
     dt_ctrl = model.opt.timestep * steps_per_frame
 
-    # --- MPC controller — weights loaded from intercept_config.py ---
-    cfg = DEFAULT_MPC_CONFIG
-    controller = MPCController(
+    # --- MPPI controller — weights loaded from mpc_control_config.py ---
+    cfg = MPPIControlConfig.from_json("skydio_x2/best_weights_mppi.json")
+    controller = MPPIController(
         horizon=cfg.horizon,
         n_samples=cfg.n_samples,
-        n_elite=cfg.n_elite,
-        n_iterations=cfg.n_iterations,
         dt=dt_ctrl,
     )
     cfg.apply_to(controller)
@@ -529,34 +524,24 @@ def run_intercept(
                     break
 
                 # --- Two-phase guidance ---
-                # CRUISE: fly flat toward lead point
-                # STRIKE: switch when drone is within strike_range of predicted target pos
-                pred_target = predict_target_pos(target_pos, target_vel,
-                                                 controller.horizon * 2, dt_ctrl)
-                dist_to_pred = np.linalg.norm(drone_pos - pred_target)
-                if phase == "cruise" and dist_to_pred <= cfg.strike_range:
+                # CRUISE: fly toward lead point; STRIKE: close in and intercept
+                drone_speed = np.linalg.norm(drone_vel)
+                if phase == "cruise" and dist_to_target <= cfg.strike_range and 2.0 <= drone_speed <= 8.0 and tilt_deg < 45.0:
                     phase = "strike"
                     cfg.apply_strike(controller)
                     controller.reset()
-                    controller._disturbance_force = np.zeros(3)  # clear stale cruise disturbance
+                    controller._disturbance_force = np.zeros(3)
                     controller._predicted_vel = None
-                    print(f"  t={sim_time:.2f}s  STRIKE PHASE  dist={dist_to_target:.2f}m")
-
-                lead = predict_target_pos(target_pos, target_vel,
-                                          controller.horizon * 2, dt_ctrl)
-                # Cap lead distance — don't send drone more than 3m past target
-                lead_offset = lead - target_pos
-                lead_dist = np.linalg.norm(lead_offset)
-                if lead_dist > 5.0:
-                    lead = target_pos + lead_offset * (5.0 / lead_dist)
+                    print(f"  t={sim_time:.2f}s  STRIKE PHASE  dist={dist_to_target:.2f}m  spd={drone_speed:.2f}m/s")
 
                 if phase == "strike":
-                    # Use full horizon — need enough lookahead to plan acceleration
-                    lead = predict_target_pos(target_pos, target_vel,
-                                              controller.horizon, dt_ctrl)
-                    # Blend toward current target_pos at close range
-                    blend = np.clip((dist_to_target - 1.5) / 2.5, 0.0, 1.0)
-                    lead = blend * lead + (1.0 - blend) * target_pos
+                    # Aim at where target will be in one control step — pure pursuit at close range
+                    lead = target_pos + target_vel * dt_ctrl * 3
+                else:
+                    lead = compute_lead_point(
+                        drone_pos, drone_vel, target_pos, target_vel,
+                        drone_speed=np.linalg.norm(drone_vel),
+                    )
 
                 ctrl = controller.solve(data, lead,
                                         target_vel=target_vel if phase == "strike" else None)
@@ -685,6 +670,8 @@ if __name__ == "__main__":
                         help="Number of iterations to run; stops and prints seed on first failure")
     args = parser.parse_args()
 
+    failed_seeds = []
+
     for iteration in range(args.iters):
         if args.iters > 1:
             print(f"\n{'='*60}\n  ITERATION {iteration + 1}/{args.iters}\n{'='*60}")
@@ -745,6 +732,13 @@ if __name__ == "__main__":
         if not hit:
             print(f"\n  FAILED on iteration {iteration + 1}" +
                   (f"  seed={seed}" if seed is not None else ""))
-            break
-        if args.iters > 1:
+            if seed is not None:
+                failed_seeds.append(seed)
+        elif args.iters > 1:
             print(f"  HIT  iteration {iteration + 1}/{args.iters}")
+
+    if args.iters > 1:
+        passed = args.iters - len(failed_seeds)
+        print(f"\nPassed: {passed}/{args.iters} ({100 * passed / args.iters:.1f}%)")
+        if failed_seeds:
+            print(f"Failed seeds ({len(failed_seeds)}): {failed_seeds}")
