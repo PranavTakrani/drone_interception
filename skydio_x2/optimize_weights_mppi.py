@@ -5,6 +5,7 @@ Usage:
     python skydio_x2/optimize_weights_mppi.py
     python skydio_x2/optimize_weights_mppi.py --trials 500 --seeds-per-trial 10
     python skydio_x2/optimize_weights_mppi.py --resume skydio_x2/best_weights_mppi.json
+    python skydio_x2/optimize_weights_mppi.py --trial-fn occluded --out skydio_x2/best_weights_mppi_occluded.json
 """
 
 import argparse
@@ -94,7 +95,13 @@ def config_to_vec(cfg: MPPIControlConfig) -> np.ndarray:
 # ======================================================================
 
 def run_trial(cfg: MPPIControlConfig, seed: int, max_time: float = 30.0,
-              intercept_radius: float = 1.0) -> dict:
+              intercept_radius: float = 1.0, observe_fn=None) -> dict:
+    """
+    Run a single trial. observe_fn is an optional callable:
+        observe_fn(true_pos, drone_pos, rng) -> (obs_or_None, obs_type)
+    If None, true position is used directly (clean data).
+    Any dotted-path function passed via --trial-fn is wrapped to inject observe_fn.
+    """
     target = RandomEvasiveTarget(
         start_pos=(8, 8, 6.0),
         max_speed=4.0,
@@ -122,12 +129,20 @@ def run_trial(cfg: MPPIControlConfig, seed: int, max_time: float = 30.0,
     controller = MPPIController(horizon=cfg.horizon, n_samples=cfg.n_samples, dt=dt_ctrl)
     cfg.apply_to(controller)
 
+    # State estimator — only used when observe_fn is provided
+    kf  = None
+    rng = None
+    if observe_fn is not None:
+        from skydio_x2.intercept_controller_occluded import TargetKalmanFilter
+        kf  = TargetKalmanFilter(target.pos.copy(), dt_ctrl)
+        rng = np.random.RandomState(seed)
+
     max_steps = int(max_time / dt_ctrl)
     min_dist = float("inf")
     phase = "cruise"
     prev_target_pos = None
 
-    for _ in range(max_steps):
+    for step in range(max_steps):
         target_pos, target_vel = target.get_state(dt_ctrl)
 
         if prev_target_pos is not None:
@@ -150,10 +165,18 @@ def run_trial(cfg: MPPIControlConfig, seed: int, max_time: float = 30.0,
         min_dist = min(min_dist, dist)
 
         if dist < intercept_radius:
-            return {"hit": True, "min_dist": min_dist, "time": _ * dt_ctrl}
+            return {"hit": True, "min_dist": min_dist, "time": step * dt_ctrl}
+
+        # --- Position estimate: use observe_fn + KF, or true pos ---
+        if observe_fn is not None:
+            obs, _ = observe_fn(target_pos, drone_pos, rng)
+            est_pos, est_vel = kf.step(obs)
+        else:
+            est_pos, est_vel = target_pos, target_vel
 
         drone_speed = np.linalg.norm(drone_vel)
-        if phase == "cruise" and dist <= cfg.strike_range and 2.0 <= drone_speed <= 8.0 and tilt_deg < 45.0:
+        est_dist = np.linalg.norm(drone_pos - est_pos)
+        if phase == "cruise" and est_dist <= cfg.strike_range and 2.0 <= drone_speed <= 8.0 and tilt_deg < 45.0:
             phase = "strike"
             cfg.apply_strike(controller)
             controller._disturbance_force = np.zeros(3)
@@ -161,13 +184,13 @@ def run_trial(cfg: MPPIControlConfig, seed: int, max_time: float = 30.0,
             controller.reset()
 
         if phase == "strike":
-            lead = target_pos + target_vel * dt_ctrl * 3
+            lead = est_pos + est_vel * dt_ctrl * 3
         else:
-            lead = compute_lead_point(drone_pos, drone_vel, target_pos, target_vel,
+            lead = compute_lead_point(drone_pos, drone_vel, est_pos, est_vel,
                                       drone_speed=drone_speed)
 
         ctrl = controller.solve(data, lead,
-                                target_vel=target_vel if phase == "strike" else None)
+                                target_vel=est_vel if phase == "strike" else None)
         t_off, p_cmd, r_cmd, y_cmd = ctrl
         apply_motor_mixing(data, p_cmd, r_cmd, y_cmd, hover_thrust + t_off)
 
@@ -189,15 +212,33 @@ def run_trial(cfg: MPPIControlConfig, seed: int, max_time: float = 30.0,
     return {"hit": False, "min_dist": min_dist, "time": None}
 
 
+def _load_trial_fn(dotted_path: str):
+    """
+    Load an observe_fn from a dotted path and wrap it into run_trial.
+    The function at dotted_path must have signature:
+        observe_fn(true_pos, drone_pos, rng) -> (obs_or_None, obs_type)
+    e.g. --trial-fn skydio_x2.intercept_controller_occluded.observe_target
+    """
+    import importlib
+    module_path, fn_name = dotted_path.rsplit(".", 1)
+    observe_fn = getattr(importlib.import_module(module_path), fn_name)
+    return lambda cfg, seed, max_time=30.0: run_trial(cfg, seed, max_time=max_time,
+                                                       observe_fn=observe_fn)
+
+
 # ======================================================================
 # Score function
 # ======================================================================
 
-def score_config(cfg: MPPIControlConfig, seeds: list, max_time: float) -> dict:
+
+def score_config(cfg: MPPIControlConfig, seeds: list, max_time: float,
+                 trial_fn=None) -> dict:
+    if trial_fn is None:
+        trial_fn = run_trial
     hits, min_dists, times = 0, [], []
     for seed in seeds:
         try:
-            r = run_trial(cfg, seed, max_time=max_time)
+            r = trial_fn(cfg, seed, max_time=max_time)
         except Exception:
             r = {"hit": False, "min_dist": 99.0, "time": None}
         if r["hit"]:
@@ -223,12 +264,18 @@ def main():
                         help="CMA-ES function evaluations (default: 200)")
     parser.add_argument("--seeds-per-trial", type=int, default=8)
     parser.add_argument("--max-time", type=float, default=30.0)
-    parser.add_argument("--out", default="skydio_x2/best_weights_mppi.json")
+    parser.add_argument("--out", default="skydio_x2/best_weights_mppi.json",
+                        help="Output JSON path for best weights")
     parser.add_argument("--resume", default=None)
     parser.add_argument("--sigma0", type=float, default=0.5,
                         help="Initial CMA-ES step size (default: 0.5)")
+    parser.add_argument("--trial-fn", default=None,
+                        help="Dotted path to trial function, e.g. "
+                             "skydio_x2.intercept_controller_occluded.run_trial_occluded "
+                             "(default: built-in run_trial)")
     args = parser.parse_args()
 
+    trial_fn = _load_trial_fn(args.trial_fn) if args.trial_fn else run_trial
     eval_seeds = list(range(args.seeds_per_trial))
 
     # Warm-start from existing best or defaults
@@ -239,7 +286,7 @@ def main():
         best_cfg = copy.deepcopy(DEFAULT_MPPI_CONFIG)
 
     print(f"\nScoring baseline on {args.seeds_per_trial} seeds...")
-    best_result = score_config(best_cfg, eval_seeds, args.max_time)
+    best_result = score_config(best_cfg, eval_seeds, args.max_time, trial_fn=trial_fn)
     best_score = best_result["score"]
     print(f"  Baseline: score={best_score:.2f}  hit={best_result['hit_rate']:.0%}  "
           f"min_d={best_result['avg_min_dist']:.3f}m")
@@ -253,7 +300,7 @@ def main():
     })
 
     print(f"\nCMA-ES: {args.trials} evals, popsize={es.popsize}, "
-          f"{args.seeds_per_trial} seeds/eval\n")
+          f"{args.seeds_per_trial} seeds/eval  trial_fn={args.trial_fn or 'run_trial'}  out={args.out}\n")
     t_start = time.time()
     eval_count = 0
 
@@ -263,7 +310,7 @@ def main():
 
         for x in solutions:
             cfg = vec_to_config(x)
-            result = score_config(cfg, eval_seeds, args.max_time)
+            result = score_config(cfg, eval_seeds, args.max_time, trial_fn=trial_fn)
             fitnesses.append(-result["score"])  # CMA-ES minimises
             eval_count += 1
 

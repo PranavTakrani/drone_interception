@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from skydio_x2.mppi_controller import MPPIController
 from skydio_x2.skydio_x2_movement import apply_motor_mixing
 from skydio_x2.mpc_control_config import DEFAULT_MPPI_CONFIG
-from skydio_x2.optimize_weights_mppi import MPPIControlConfig
+from skydio_x2.mpc_control_config import MPPIControlConfig
 from skydio_x2.intercept_controller import (
     build_intercept_xml,
     compute_lead_point,
@@ -42,44 +42,72 @@ from skydio_x2.intercept_controller import (
 # ======================================================================
 # Occlusion / Sensor Model
 #
-# P(occluded | t) = base * exp(-k * t) + noise_floor
-#   base=0.6, k=0.08, noise_floor=0.05
-#   => starts ~65% occluded, decays to ~5% floor
+# Occlusion has two independent parts:
 #
-# When not occluded, observation = true_pos + Gaussian noise (std=0.3m)
-# With probability outlier_prob, a large outlier spike is added instead.
+#   1. NO-DATA  — sensor returns nothing (hard dropout)
+#   2. NOISY    — sensor returns a corrupted position (Gaussian + outliers)
+#
+# Both probabilities share the same distance-driven exponential decay:
+#
+#   P(event | d) = initial * exp(-decay * (1/d + jitter)) + floor
+#
+# where d = distance between drone and target.
+# Closer drone → smaller d → faster decay → lower occlusion probability.
+# Jitter is per-step Gaussian noise on the exponent, making the decay noisy.
+#
+# Occlusion rate reported = % of steps that were either no-data OR noisy.
 # ======================================================================
 
-OCCLUSION_BASE       = 0.3
-OCCLUSION_DECAY      = 0.08
-OCCLUSION_FLOOR      = 0.05
-OBS_NOISE_STD        = 0.3    # metres, normal measurement noise
-OUTLIER_PROB         = 0.05   # probability of a large outlier when not occluded
-OUTLIER_SCALE        = 3.0    # outlier magnitude multiplier
+# --- No-data dropout parameters ---
+NO_DATA_INITIAL = 0.35   # starting probability of total signal loss
+NO_DATA_DECAY   = 0.08   # how fast dropout falls with proximity
+NO_DATA_FLOOR   = 0.03   # minimum dropout probability (never fully reliable)
+
+# --- Noisy / outlier observation parameters ---
+NOISY_INITIAL   = 0.45   # starting probability of receiving a corrupted obs
+NOISY_DECAY     = 0.05   # how fast noise probability falls with proximity
+NOISY_FLOOR     = 0.02   # minimum noisy-obs probability
+OBS_NOISE_STD   = 0.3    # metres — Gaussian noise std on normal observations
+OUTLIER_PROB    = 0.15   # fraction of noisy obs that are large outlier spikes
+OUTLIER_SCALE   = 3.0    # outlier spike magnitude (multiplier on OBS_NOISE_STD)
+
+# --- Jitter on the decay exponent (makes rate itself stochastic) ---
+DECAY_JITTER_STD = 0.02
 
 
-def occlusion_prob(t: float, rng: np.random.RandomState) -> float:
-    """Time-varying occlusion probability with small per-step jitter."""
-    base_p = OCCLUSION_BASE * np.exp(-OCCLUSION_DECAY * t) + OCCLUSION_FLOOR
-    # Add ±10% jitter so the probability itself is stochastic
-    return float(np.clip(base_p + rng.uniform(-0.05, 0.05), 0.0, 1.0))
-
-
-def observe_target(true_pos: np.ndarray, t: float, rng: np.random.RandomState):
+def _decayed_prob(initial: float, decay: float, floor: float,
+                  dist: float, rng: np.random.RandomState) -> float:
     """
-    Returns (observation, occluded):
-      observation — noisy 3-vector or None if occluded
-      occluded    — bool
+    Distance-driven exponential decay with per-step jitter.
+    Uses 1/dist so probability drops as drone closes in.
     """
-    if rng.random() < occlusion_prob(t, rng):
-        return None, True
+    d = max(dist, 0.1)  # avoid division by zero
+    jitter = rng.normal(0.0, DECAY_JITTER_STD)
+    p = initial * np.exp(-decay * (1.0 / d + jitter)) + floor
+    return float(np.clip(p, 0.0, 1.0))
 
-    noise_std = OBS_NOISE_STD
-    if rng.random() < OUTLIER_PROB:
-        noise_std *= OUTLIER_SCALE  # large spike
 
-    obs = true_pos + rng.normal(0.0, noise_std, size=3)
-    return obs, False
+def observe_target(true_pos: np.ndarray, drone_pos: np.ndarray,
+                   rng: np.random.RandomState):
+    """
+    Returns (observation, obs_type):
+      observation — noisy 3-vector, or None if no-data
+      obs_type    — "clean", "noisy", "outlier", or "no_data"
+    """
+    dist = np.linalg.norm(true_pos - drone_pos)
+
+    # Part 1: hard dropout — no data at all
+    if rng.random() < _decayed_prob(NO_DATA_INITIAL, NO_DATA_DECAY, NO_DATA_FLOOR, dist, rng):
+        return None, "no_data"
+
+    # Part 2: noisy observation
+    if rng.random() < _decayed_prob(NOISY_INITIAL, NOISY_DECAY, NOISY_FLOOR, dist, rng):
+        noise_std = OBS_NOISE_STD * (OUTLIER_SCALE if rng.random() < OUTLIER_PROB else 1.0)
+        obs_type  = "outlier" if noise_std > OBS_NOISE_STD else "noisy"
+        return true_pos + rng.normal(0.0, noise_std, size=3), obs_type
+
+    # Clean observation (still has small sensor noise)
+    return true_pos + rng.normal(0.0, OBS_NOISE_STD * 0.3, size=3), "clean"
 
 
 # ======================================================================
@@ -151,48 +179,54 @@ class TargetKalmanFilter:
 def plot_trajectory(log: dict, save_path: str = None):
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
     except ImportError:
         print("  matplotlib not available — skipping graph.")
         return
 
-    times      = np.array(log["t"])
-    actual     = np.array(log["actual"])      # (N, 3)
-    estimated  = np.array(log["estimated"])   # (N, 3)
-    obs_times  = np.array(log["obs_t"])
-    obs_pos    = np.array(log["obs_pos"]) if log["obs_pos"] else np.empty((0, 3))
-    occluded_t = np.array(log["occluded_t"])
+    times     = np.array(log["t"])
+    actual    = np.array(log["actual"])
+    estimated = np.array(log["estimated"])
+    obs_pos   = np.array(log["obs_pos"]) if log["obs_pos"] else np.empty((0, 3))
+    obs_types = np.array(log["obs_type"]) if log["obs_type"] else np.array([])
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=False)
 
     # --- Top: XY trajectories ---
     ax = axes[0]
     ax.plot(actual[:, 0],    actual[:, 1],    "b-",  lw=1.5, label="Actual target")
     ax.plot(estimated[:, 0], estimated[:, 1], "r--", lw=1.5, label="KF estimate")
     if len(obs_pos):
-        ax.scatter(obs_pos[:, 0], obs_pos[:, 1], s=6, c="orange", alpha=0.4, label="Observations")
+        for otype, color, label in [("clean",   "green",  "Clean obs"),
+                                     ("noisy",   "orange", "Noisy obs"),
+                                     ("outlier", "red",    "Outlier obs")]:
+            mask = obs_types == otype
+            if mask.any():
+                ax.scatter(obs_pos[mask, 0], obs_pos[mask, 1],
+                           s=8, c=color, alpha=0.5, label=label)
     ax.set_ylabel("Y position (m)")
     ax.set_xlabel("X position (m)")
-    ax.set_title("Target trajectory — actual vs Kalman estimate (XY plane)")
+    ax.set_title("Target trajectory — actual vs KF estimate (XY plane)")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    # --- Bottom: position error over time ---
+    # --- Bottom: estimation error over time ---
     ax2 = axes[1]
     err = np.linalg.norm(actual - estimated, axis=1)
-    ax2.plot(times, err, "k-", lw=1.2, label="Estimation error (m)")
+    ax2.plot(times, err, "k-", lw=1.2)
+    for t in log["no_data_t"]:
+        ax2.axvline(t, color="red",    alpha=0.08, lw=0.8)
+    for t in log["noisy_t"]:
+        ax2.axvline(t, color="orange", alpha=0.12, lw=0.8)
 
-    # Shade occluded periods
-    if len(occluded_t):
-        for ot in occluded_t:
-            ax2.axvline(ot, color="gray", alpha=0.15, lw=0.8)
-    # Dummy entry for legend
-    from matplotlib.lines import Line2D
-    ax2.add_artist(Line2D([0], [0], color="gray", alpha=0.5, lw=4, label="Occluded timesteps"))
-
+    ax2.legend(handles=[
+        Line2D([0], [0], color="k",      lw=1.5,           label="Estimation error (m)"),
+        Line2D([0], [0], color="red",    lw=4, alpha=0.4,  label="No-data steps"),
+        Line2D([0], [0], color="orange", lw=4, alpha=0.4,  label="Noisy/outlier steps"),
+    ])
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Position error (m)")
-    ax2.set_title("Kalman filter estimation error over time")
-    ax2.legend()
+    ax2.set_title("KF estimation error — shaded by occlusion type")
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
@@ -221,6 +255,7 @@ def run_intercept_occluded(
     debug=False,
     headless=False,
     graph_out=None,
+    no_graph=False,
     seed=None,
 ):
     rng = np.random.RandomState(seed)
@@ -267,7 +302,9 @@ def run_intercept_occluded(
     kf = TargetKalmanFilter(ts, dt_ctrl)
 
     # Trajectory log for graphing
-    log = {"t": [], "actual": [], "estimated": [], "obs_t": [], "obs_pos": [], "occluded_t": []}
+    log = {"t": [], "actual": [], "estimated": [],
+           "obs_t": [], "obs_pos": [], "obs_type": [],
+           "no_data_t": [], "noisy_t": []}
 
     intercepted   = False
     min_dist_seen = float("inf")
@@ -279,8 +316,9 @@ def run_intercept_occluded(
     print(f"{'='*60}")
     print(f"  Interceptor start : {interceptor_start}")
     print(f"  Target start      : {target_start}")
-    print(f"  Occlusion model   : base={OCCLUSION_BASE} decay={OCCLUSION_DECAY} floor={OCCLUSION_FLOOR}")
-    print(f"  Obs noise std     : {OBS_NOISE_STD} m  outlier_prob={OUTLIER_PROB}")
+    print(f"  No-data model     : initial={NO_DATA_INITIAL} decay={NO_DATA_DECAY} floor={NO_DATA_FLOOR}")
+    print(f"  Noisy model       : initial={NOISY_INITIAL} decay={NOISY_DECAY} floor={NOISY_FLOOR}")
+    print(f"  Obs noise std     : {OBS_NOISE_STD} m  outlier_prob={OUTLIER_PROB}  outlier_scale={OUTLIER_SCALE}x")
     print(f"{'='*60}\n")
 
     def _run_loop(viewer):
@@ -305,7 +343,8 @@ def run_intercept_occluded(
                 data.qvel[9:12] = [0, 0, 0]
 
                 # --- Observation model ---
-                obs, occluded = observe_target(true_pos, sim_time, rng)
+                drone_pos  = data.qpos[:3].copy()
+                obs, obs_type = observe_target(true_pos, drone_pos, rng)
 
                 # --- Kalman filter update ---
                 est_pos, est_vel = kf.step(obs)
@@ -314,14 +353,16 @@ def run_intercept_occluded(
                 log["t"].append(sim_time)
                 log["actual"].append(true_pos.copy())
                 log["estimated"].append(est_pos.copy())
-                if not occluded:
+                if obs_type == "no_data":
+                    log["no_data_t"].append(sim_time)
+                else:
                     log["obs_t"].append(sim_time)
                     log["obs_pos"].append(obs.copy())
-                else:
-                    log["occluded_t"].append(sim_time)
+                    log["obs_type"].append(obs_type)
+                    if obs_type in ("noisy", "outlier"):
+                        log["noisy_t"].append(sim_time)
 
                 # --- Drone state ---
-                drone_pos  = data.qpos[:3].copy()
                 drone_vel  = data.qvel[:3].copy()
                 drone_quat = data.qpos[3:7].copy()
                 tilt_deg   = np.degrees(2.0 * np.arcsin(np.clip(
@@ -394,9 +435,9 @@ def run_intercept_occluded(
                     fpv_img = renderer.render()
                     fpv_bgr = cv2.cvtColor(fpv_img, cv2.COLOR_RGB2BGR)
                     fpv_bgr = cv2.flip(fpv_bgr, 0)
-                    occ_color = (0, 0, 255) if occluded else (0, 255, 0)
+                    occ_color = (0, 0, 255) if obs_type == "no_data" else (0, 165, 255) if obs_type in ("noisy", "outlier") else (0, 255, 0)
                     cv2.putText(fpv_bgr,
-                        f"{'OCCLUDED' if occluded else 'TRACKING'}  t={sim_time:.1f}s  "
+                        f"{obs_type.upper()}  t={sim_time:.1f}s  "
                         f"dist={dist_to_target:.2f}m  est_err={np.linalg.norm(est_pos-true_pos):.2f}m",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, occ_color, 2)
                     cv2.imshow("Interceptor FPV (Occluded)", fpv_bgr)
@@ -407,11 +448,13 @@ def run_intercept_occluded(
 
                 # Periodic status
                 if int(sim_time * 10) % 20 == 0 and int(sim_time * 10) > 0:
-                    occ_pct = 100 * len(log["occluded_t"]) / max(len(log["t"]), 1)
+                    n = max(len(log["t"]), 1)
+                    nd_pct = 100 * len(log["no_data_t"]) / n
+                    ny_pct = 100 * len(log["noisy_t"]) / n
                     print(
                         f"  t={sim_time:.1f}s  dist={dist_to_target:.2f}m  "
                         f"est_err={np.linalg.norm(est_pos-true_pos):.2f}m  "
-                        f"occ={occ_pct:.0f}%  phase={phase}"
+                        f"no_data={nd_pct:.0f}%  noisy={ny_pct:.0f}%  phase={phase}"
                     )
 
         finally:
@@ -429,12 +472,16 @@ def run_intercept_occluded(
             viewer.cam.lookat    = [2.5, 2.5, 2.0]
             _run_loop(viewer)
 
-    occ_pct = 100 * len(log["occluded_t"]) / max(len(log["t"]), 1)
+    n = max(len(log["t"]), 1)
+    nd_pct = 100 * len(log["no_data_t"]) / n
+    ny_pct = 100 * len(log["noisy_t"]) / n
     print(f"Intercept scenario complete — {'HIT' if intercepted else 'MISS'}  "
-          f"(occlusion rate: {occ_pct:.1f}%)")
+          f"(no-data: {nd_pct:.1f}%  noisy/outlier: {ny_pct:.1f}%  "
+          f"total occlusion: {nd_pct + ny_pct:.1f}%)")
 
     # Generate graph
-    plot_trajectory(log, save_path=graph_out)
+    if not no_graph:
+        plot_trajectory(log, save_path=graph_out)
 
     return intercepted
 
@@ -456,6 +503,8 @@ if __name__ == "__main__":
     parser.add_argument("--graph-out", default=None,
                         help="Path to save trajectory graph (e.g. traj.png). "
                              "If omitted, graph is shown interactively.")
+    parser.add_argument("--no-graph", action="store_true",
+                        help="Disable graph output entirely.")
     args = parser.parse_args()
 
     failed_seeds = []
@@ -487,6 +536,7 @@ if __name__ == "__main__":
                 debug=args.debug,
                 headless=args.headless,
                 graph_out=args.graph_out,
+                no_graph=args.no_graph,
                 seed=seed,
             )
         else:
@@ -508,6 +558,7 @@ if __name__ == "__main__":
                 debug=args.debug,
                 headless=args.headless,
                 graph_out=args.graph_out,
+                no_graph=args.no_graph,
             )
 
         if not hit:

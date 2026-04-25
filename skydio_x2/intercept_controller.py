@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from skydio_x2.mppi_controller import MPPIController
 from skydio_x2.skydio_x2_movement import apply_motor_mixing
 from skydio_x2.mpc_control_config import DEFAULT_MPPI_CONFIG
-from skydio_x2.optimize_weights_mppi import MPPIControlConfig
+from skydio_x2.mpc_control_config import MPPIControlConfig
 
 
 # ======================================================================
