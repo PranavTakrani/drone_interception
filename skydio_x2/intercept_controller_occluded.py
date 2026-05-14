@@ -247,7 +247,7 @@ def run_intercept_occluded(
     target_speed=2,
     interceptor_start="0 0 1.5",
     target_start=None,
-    intercept_radius=1.0,
+    intercept_radius=0.6,
     max_duration=30.0,
     record=False,
     video_out="intercept_occluded.mp4",
@@ -311,6 +311,27 @@ def run_intercept_occluded(
     phase         = "cruise"
     prev_target_pos = None
 
+    # --- Video recording setup ---
+    fpv_writer = None
+    third_person_renderer = None
+    third_person_writer = None
+    if record:
+        os.makedirs(os.path.dirname(os.path.abspath(video_out)), exist_ok=True)
+        fpv_out = video_out.replace(".avi", ".mp4").replace(".mp4", "_fpv.mp4")
+        tp_out  = video_out.replace(".avi", ".mp4").replace(".mp4", "_3rdperson.mp4")
+        fourcc  = cv2.VideoWriter_fourcc(*"mp4v")
+        rec_fps = int(round(1.0 / dt_ctrl))
+        fpv_writer = cv2.VideoWriter(fpv_out, fourcc, rec_fps, (640, 480))
+        third_person_renderer = mujoco.Renderer(model, height=720, width=1280)
+        third_person_writer   = cv2.VideoWriter(tp_out, fourcc, rec_fps, (1280, 720))
+        if not fpv_writer.isOpened() or not third_person_writer.isOpened():
+            print("  WARNING: Failed to open video writers!")
+        print(f"  Recording FPV to:        {fpv_out}")
+        print(f"  Recording 3rd-person to: {tp_out}  ({rec_fps} fps)")
+        print(f"  Recording 3rd-person to: {tp_out}")
+    _rec_dt   = 1.0 / 30  # sim-time interval between recorded frames
+    _next_rec = 0.0
+
     print(f"\n{'='*60}")
     print(f"  DRONE INTERCEPT (OCCLUDED) — MPPI + Kalman Filter")
     print(f"{'='*60}")
@@ -322,7 +343,7 @@ def run_intercept_occluded(
     print(f"{'='*60}\n")
 
     def _run_loop(viewer):
-        nonlocal intercepted, min_dist_seen, phase, prev_target_pos
+        nonlocal intercepted, min_dist_seen, phase, prev_target_pos, _next_rec
         sim_time = 0.0
 
         try:
@@ -377,6 +398,30 @@ def run_intercept_occluded(
                     print(f"  Distance: {dist_to_target:.4f} m")
                     print(f"{'*'*60}\n")
                     intercepted = True
+                    # Apply interceptor velocity as impulse to target, then let physics run free
+                    impulse = drone_vel * 1.5
+                    data.qvel[6:9]  = impulse
+                    data.qvel[9:12] = rng.uniform(-4, 4, 3)  # random tumble
+                    collision_end = sim_time + 0.5
+                    while sim_time < collision_end:
+                        # No pinning — target falls/tumbles freely
+                        for _ in range(steps_per_frame):
+                            mujoco.mj_step(model, data)
+                        sim_time += dt_ctrl
+                        if record:
+                            mujoco.mj_forward(model, data)
+                            renderer.update_scene(data, camera=fpv_cam_id)
+                            fpv_img = renderer.render()
+                            fpv_bgr = cv2.cvtColor(fpv_img, cv2.COLOR_RGB2BGR)
+                            cv2.putText(fpv_bgr, "IMPACT", (240, 240),
+                                cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 255), 4)
+                            fpv_writer.write(fpv_bgr)
+                            third_person_renderer.update_scene(data)
+                            tp_img = third_person_renderer.render()
+                            tp_bgr = cv2.cvtColor(tp_img, cv2.COLOR_RGB2BGR)
+                            third_person_writer.write(tp_bgr)
+                        elif not headless:
+                            viewer.sync()
                     break
 
                 # --- Phase transition ---
@@ -428,23 +473,33 @@ def run_intercept_occluded(
                         f"dist={dist_to_target:.2f}m  phase={phase}"
                     )
 
-                if not headless:
-                    viewer.sync()
+                if not headless or record:
                     mujoco.mj_forward(model, data)
                     renderer.update_scene(data, camera=fpv_cam_id)
                     fpv_img = renderer.render()
                     fpv_bgr = cv2.cvtColor(fpv_img, cv2.COLOR_RGB2BGR)
-                    fpv_bgr = cv2.flip(fpv_bgr, 0)
                     occ_color = (0, 0, 255) if obs_type == "no_data" else (0, 165, 255) if obs_type in ("noisy", "outlier") else (0, 255, 0)
                     cv2.putText(fpv_bgr,
                         f"{obs_type.upper()}  t={sim_time:.1f}s  "
                         f"dist={dist_to_target:.2f}m  est_err={np.linalg.norm(est_pos-true_pos):.2f}m",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, occ_color, 2)
-                    cv2.imshow("Interceptor FPV (Occluded)", fpv_bgr)
-                    cv2.waitKey(1)
-                    frame_elapsed = time.time() - step_start
-                    if frame_elapsed < dt_render:
-                        time.sleep(dt_render - frame_elapsed)
+
+                    if not headless:
+                        viewer.sync()
+                        cv2.imshow("Interceptor FPV (Occluded)", fpv_bgr)
+                        cv2.waitKey(1)
+                        frame_elapsed = time.time() - step_start
+                        if frame_elapsed < dt_render:
+                            time.sleep(dt_render - frame_elapsed)
+
+                    if record:
+                        fpv_writer.write(fpv_bgr)
+                        third_person_renderer.update_scene(data)
+                        tp_img = third_person_renderer.render()
+                        tp_bgr = cv2.cvtColor(tp_img, cv2.COLOR_RGB2BGR)
+                        cv2.putText(tp_bgr, f"t={sim_time:.1f}s  dist={dist_to_target:.2f}m",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        third_person_writer.write(tp_bgr)
 
                 # Periodic status
                 if int(sim_time * 10) % 20 == 0 and int(sim_time * 10) > 0:
@@ -461,6 +516,11 @@ def run_intercept_occluded(
             if not headless:
                 cv2.destroyAllWindows()
                 renderer.close()
+            if record:
+                fpv_writer.release()
+                third_person_writer.release()
+                third_person_renderer.close()
+                print(f"  Videos saved.")
 
     if headless:
         _run_loop(None)
@@ -483,7 +543,7 @@ def run_intercept_occluded(
     if not no_graph:
         plot_trajectory(log, save_path=graph_out)
 
-    return intercepted
+    return intercepted, len(log["no_data_t"]), len(log["noisy_t"]), n
 
 
 # ======================================================================
@@ -497,15 +557,73 @@ if __name__ == "__main__":
     parser.add_argument("--target-speed", type=float, default=4.0)
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--record", action="store_true")
-    parser.add_argument("--video-out", default="intercept_occluded.mp4")
+    parser.add_argument("--record", nargs="?", const=".", default=None,
+                        metavar="FOLDER", help="Record video to FOLDER (default: current directory).")
     parser.add_argument("--iters", type=int, default=1)
     parser.add_argument("--graph-out", default=None,
                         help="Path to save trajectory graph (e.g. traj.png). "
                              "If omitted, graph is shown interactively.")
     parser.add_argument("--no-graph", action="store_true",
                         help="Disable graph output entirely.")
+    parser.add_argument("--seed-file", default=None,
+                        help="Path to a txt file containing seeds as [seed1, seed2, ...]. "
+                             "Runs only those seeds; ignores --iters and --seed.")
     args = parser.parse_args()
+
+    # --seed-file mode: parse seeds and run each one, then print summary
+    if args.seed_file is not None:
+        import ast
+        with open(args.seed_file) as f:
+            seeds = ast.literal_eval(f.read().strip())
+        if not isinstance(seeds, list):
+            raise ValueError("Seed file must contain a Python list, e.g. [1, 2, 3]")
+
+        hits, misses = 0, 0
+        total_nd, total_ny, total_steps = 0, 0, 0
+
+        for i, seed in enumerate(seeds):
+            print(f"\n{'='*60}\n  SEED {seed}  ({i+1}/{len(seeds)})\n{'='*60}")
+            target = RandomEvasiveTarget(
+                start_pos=(8, 8, 6.0),
+                max_speed=args.target_speed,
+                max_accel=3.0,
+                bias_pos=(-8, 0, 5.0),
+                bias_strength=2.5,
+                altitude_range=(4.0, 8.0),
+                bounds=((-10, 10), (-10, 10)),
+                seed=seed,
+            )
+            hit, nd, ny, n_steps = run_intercept_occluded(
+                interceptor_start="0 0 5.0",
+                intercept_radius=0.6,
+                max_duration=45.0,
+                record=bool(args.record),
+                video_out=os.path.join(args.record or ".", f"intercept_occluded_{seed}.mp4"),
+                target_path_override=target,
+                debug=args.debug,
+                headless=args.headless,
+                graph_out=args.graph_out,
+                no_graph=args.no_graph,
+                seed=seed,
+            )
+            if hit:
+                hits += 1
+            else:
+                misses += 1
+            total_nd    += nd
+            total_ny    += ny
+            total_steps += n_steps
+
+        total = hits + misses
+        nd_pct = 100 * total_nd    / max(total_steps, 1)
+        ny_pct = 100 * total_ny    / max(total_steps, 1)
+        print(f"\n{'='*60}")
+        print(f"  Seed-file batch complete — {hits} hit / {misses} miss  ({100*hits/total:.1f}% hit rate)")
+        print(f"  Intercept scenario complete — hits  "
+              f"(no-data: {nd_pct:.1f}%  noisy/outlier: {ny_pct:.1f}%  "
+              f"total occlusion: {nd_pct + ny_pct:.1f}%)")
+        print(f"{'='*60}\n")
+        sys.exit(0)
 
     failed_seeds = []
 
@@ -526,12 +644,12 @@ if __name__ == "__main__":
                 bounds=((-10, 10), (-10, 10)),
                 seed=seed,
             )
-            hit = run_intercept_occluded(
+            hit, _, _, _ = run_intercept_occluded(
                 interceptor_start="0 0 5.0",
-                intercept_radius=1.0,
+                intercept_radius=0.6,
                 max_duration=45.0,
-                record=args.record,
-                video_out=args.video_out,
+                record=bool(args.record),
+                video_out=os.path.join(args.record or ".", f"intercept_occluded_{seed}.mp4"),
                 target_path_override=target,
                 debug=args.debug,
                 headless=args.headless,
@@ -547,14 +665,14 @@ if __name__ == "__main__":
                 [-6, 2, 6.0],  [-8, -2, 6.5], [-6, -4, 6.0], [-4, -2, 6.5],
                 [-2, -4, 6.0], [0, 0, 6.5],
             ]
-            hit = run_intercept_occluded(
+            hit, _, _, _ = run_intercept_occluded(
                 target_waypoints=TARGET_PATH,
                 target_speed=args.target_speed,
                 interceptor_start="0 0 5.0",
-                intercept_radius=1.0,
+                intercept_radius=0.6,
                 max_duration=45.0,
-                record=args.record,
-                video_out=args.video_out,
+                record=bool(args.record),
+                video_out=os.path.join(args.record or ".", "intercept_occluded.mp4"),
                 debug=args.debug,
                 headless=args.headless,
                 graph_out=args.graph_out,
